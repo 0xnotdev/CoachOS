@@ -1,6 +1,8 @@
 'use client';
 
 import { useEffect, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { supabase } from "./supabase";
 import "./globals.css";
 
 interface AlertItem {
@@ -36,17 +38,21 @@ interface ClientListItem {
 type TabType = "briefing" | "clients" | "onboard";
 
 export default function Home() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<TabType>("briefing");
-  const [data, setData] = useState<BriefingData | null>(null);
-  const [clients, setClients] = useState<ClientListItem[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const [actioningId, setActioningId] = useState<string | null>(null);
-  
-  // Real token auth state
   const [token, setToken] = useState<string>("");
+  
+  // Custom manual auth input states
+  const [showManualAuth, setShowManualAuth] = useState<boolean>(false);
+  const [manualToken, setManualToken] = useState<string>("");
 
-  // Onboarding registration state
+  // Supabase Auth input states
+  const [authEmail, setAuthEmail] = useState<string>("");
+  const [authPassword, setAuthPassword] = useState<string>("");
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [authLoading, setAuthLoading] = useState<boolean>(false);
+
+  // Onboarding registration input states
   const [regName, setRegName] = useState<string>("");
   const [regEmail, setRegEmail] = useState<string>("");
   const [stripeAcct, setStripeAcct] = useState<string>("");
@@ -55,16 +61,48 @@ export default function Home() {
 
   const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+  // 1. Initialize Authentication session tracking
   useEffect(() => {
+    // Load local token if present
     const savedToken = localStorage.getItem("supabase_jwt") || "";
-    setToken(savedToken);
-  }, []);
+    if (savedToken) {
+      setToken(savedToken);
+      setManualToken(savedToken);
+    }
 
-  const handleTokenChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setToken(value);
-    localStorage.setItem("supabase_jwt", value);
-  };
+    if (!supabase) {
+      setShowManualAuth(true);
+      return;
+    }
+
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session) {
+        const accessToken = session.access_token;
+        setToken(accessToken);
+        localStorage.setItem("supabase_jwt", accessToken);
+        setShowManualAuth(false);
+      } else {
+        setShowManualAuth(true);
+      }
+    });
+
+    // Listen for authentication changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (session) {
+        const accessToken = session.access_token;
+        setToken(accessToken);
+        localStorage.setItem("supabase_jwt", accessToken);
+        setShowManualAuth(false);
+      } else {
+        setToken("");
+        localStorage.removeItem("supabase_jwt");
+        setShowManualAuth(true);
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
 
   const getHeaders = () => {
     return {
@@ -73,122 +111,106 @@ export default function Home() {
     };
   };
 
-  const fetchBriefing = async () => {
-    if (!token) return;
-    setLoading(true);
-    setError(null);
-    try {
+  // 2. React Query: Fetch Morning Briefing
+  const { 
+    data: briefingData, 
+    isLoading: isBriefingLoading, 
+    error: briefingError, 
+    refetch: refetchBriefing 
+  } = useQuery<BriefingData>({
+    queryKey: ["briefing", token],
+    queryFn: async () => {
       const response = await fetch(`${API_URL}/api/v1/briefing/today`, {
         headers: getHeaders()
       });
-      
       if (response.status === 401) {
-        throw new Error("Invalid or Expired JWT. Please verify your Supabase credentials.");
+        throw new Error("Invalid or Expired JWT credentials.");
       }
       if (response.status === 403) {
-        throw new Error("Your user profile is not registered as a coach. Please register your account configuration.");
+        throw new Error("Your user profile is not registered as a coach.");
       }
       if (!response.ok) {
-        throw new Error("Failed to retrieve briefing.");
+        throw new Error("Failed to fetch today's briefing.");
       }
-      const resData: BriefingData = await response.json();
-      setData(resData);
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-    } finally {
-      setLoading(false);
-    }
-  };
+      return response.json();
+    },
+    enabled: !!token && activeTab === "briefing",
+  });
 
-  const fetchClients = async () => {
-    if (!token) return;
-    setLoading(true);
-    setError(null);
-    try {
+  // 3. React Query: Fetch Client List
+  const { 
+    data: clientsData = [], 
+    isLoading: isClientsLoading, 
+    error: clientsError, 
+    refetch: refetchClients 
+  } = useQuery<ClientListItem[]>({
+    queryKey: ["clients", token],
+    queryFn: async () => {
       const response = await fetch(`${API_URL}/api/v1/briefing/clients`, {
         headers: getHeaders()
       });
       if (response.status === 401) {
-        throw new Error("Invalid or Expired JWT.");
+        throw new Error("Invalid or Expired JWT credentials.");
       }
       if (response.status === 403) {
-        throw new Error("Your user profile is not registered as a coach. Please register your account configuration.");
+        throw new Error("Your user profile is not registered as a coach.");
       }
       if (!response.ok) {
-        throw new Error("Failed to retrieve client roster.");
+        throw new Error("Failed to fetch client registry.");
       }
-      const clientData: ClientListItem[] = await response.json();
-      setClients(clientData);
-    } catch (err: any) {
-      setError(err.message || "An unexpected error occurred.");
-    } finally {
-      setLoading(false);
-    }
-  };
+      return response.json();
+    },
+    enabled: !!token && activeTab === "clients",
+  });
 
-  const handleUpdateAction = async (actionId: string, clientName: string, status: "completed" | "rejected") => {
-    setActioningId(actionId);
-    try {
+  // 4. React Query Mutation: Execute / Dismiss Alerts
+  const actionMutation = useMutation({
+    mutationFn: async ({ actionId, status }: { actionId: string, status: "completed" | "rejected" }) => {
       const response = await fetch(`${API_URL}/api/v1/actions/${actionId}`, {
         method: "PATCH",
         headers: getHeaders(),
         body: JSON.stringify({ status })
       });
-
       if (!response.ok) {
-        throw new Error(`Failed to update action to ${status}.`);
+        throw new Error("Failed to update status on the action.");
       }
-
-      if (data) {
-        const updatedAlerts = data.urgent_alerts.filter(a => a.action_id !== actionId);
-        setData({
-          ...data,
-          urgent_alerts: updatedAlerts,
-          active_signals_count: Math.max(0, data.active_signals_count - 1),
-          pending_actions_count: Math.max(0, data.pending_actions_count - 1)
-        });
-      }
-      alert(`Action successfully ${status === 'completed' ? 'executed' : 'dismissed'} for ${clientName}`);
-    } catch (err: any) {
-      alert(`Error updating action: ${err.message}`);
-    } finally {
-      setActioningId(null);
+      return response.json();
+    },
+    onSuccess: (data, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["briefing", token] });
+      alert(`Action successfully ${variables.status === 'completed' ? 'executed' : 'dismissed'}.`);
+    },
+    onError: (err: any) => {
+      alert(`Action execution failed: ${err.message}`);
     }
-  };
+  });
 
-  const handleRegisterCoach = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!token) {
-      alert("Please paste your Supabase JWT above before registering.");
-      return;
-    }
-    setLoading(true);
-    setOnboardResult(null);
-    try {
+  // 5. React Query Mutation: Onboard Coach Profile
+  const onboardMutation = useMutation({
+    mutationFn: async (payload: { name: string, email: string, stripe_connected_account_id: string | null, webhook_secret: string | null }) => {
       const response = await fetch(`${API_URL}/api/v1/coaches/register`, {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
-          name: regName,
-          email: regEmail,
-          stripe_connected_account_id: stripeAcct || null
+          name: payload.name,
+          email: payload.email,
+          stripe_connected_account_id: payload.stripe_connected_account_id
         })
       });
 
       if (!response.ok) {
         const errPayload = await response.json();
-        throw new Error(errPayload.detail || "Registration failed.");
+        throw new Error(errPayload.detail || "Registration request failed.");
       }
 
       const res = await response.json();
       
-      // If a webhook secret is specified, securely patch it using the separate integration endpoint
-      if (webhookSecret) {
+      if (payload.webhook_secret) {
         const secretResponse = await fetch(`${API_URL}/api/v1/coaches/integrations/stripe`, {
           method: "PATCH",
           headers: getHeaders(),
           body: JSON.stringify({
-            stripe_webhook_secret: webhookSecret
+            stripe_webhook_secret: payload.webhook_secret
           })
         });
         if (!secretResponse.ok) {
@@ -197,28 +219,88 @@ export default function Home() {
         }
       }
 
+      return res;
+    },
+    onSuccess: (res) => {
       setOnboardResult(res);
       alert("Registration completed successfully!");
+      queryClient.invalidateQueries({ queryKey: ["briefing", token] });
+      queryClient.invalidateQueries({ queryKey: ["clients", token] });
       setActiveTab("briefing");
+    },
+    onError: (err: any) => {
+      alert(`Onboarding setup failed: ${err.message}`);
+    }
+  });
+
+  // Handle manual token submission
+  const handleManualTokenSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualToken.trim()) return;
+    setToken(manualToken.trim());
+    localStorage.setItem("supabase_jwt", manualToken.trim());
+    alert("Token configured successfully.");
+  };
+
+  // Handle Supabase Auth sign-in or sign-up
+  const handleSupabaseAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supabase) return;
+    setAuthLoading(true);
+    try {
+      if (authMode === "login") {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: authEmail,
+          password: authPassword
+        });
+        if (error) throw error;
+        if (data.session) {
+          setToken(data.session.access_token);
+          localStorage.setItem("supabase_jwt", data.session.access_token);
+          alert("Logged in successfully!");
+        }
+      } else {
+        const { data, error } = await supabase.auth.signUp({
+          email: authEmail,
+          password: authPassword
+        });
+        if (error) throw error;
+        alert("Check your email for confirmation link!");
+      }
     } catch (err: any) {
-      alert(`Onboarding error: ${err.message}`);
+      alert(`Auth failed: ${err.message}`);
     } finally {
-      setLoading(false);
+      setAuthLoading(false);
     }
   };
 
-  useEffect(() => {
-    if (token) {
-      if (activeTab === "briefing") {
-        fetchBriefing();
-      } else if (activeTab === "clients") {
-        fetchClients();
-      }
-    } else {
-      setData(null);
-      setClients([]);
+  const handleLogout = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
     }
-  }, [activeTab, token]);
+    setToken("");
+    setManualToken("");
+    localStorage.removeItem("supabase_jwt");
+    setShowManualAuth(true);
+    alert("Logged out successfully.");
+  };
+
+  const handleRegisterFormSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) {
+      alert("You must be authenticated before registering.");
+      return;
+    }
+    onboardMutation.mutate({
+      name: regName,
+      email: regEmail,
+      stripe_connected_account_id: stripeAcct || null,
+      webhook_secret: webhookSecret || null
+    });
+  };
+
+  const activeError = activeTab === "briefing" ? briefingError : clientsError;
+  const activeLoading = activeTab === "briefing" ? isBriefingLoading : isClientsLoading;
 
   return (
     <div className="layout animate-fade-in">
@@ -263,49 +345,119 @@ export default function Home() {
           
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', alignItems: 'flex-end' }}>
             <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-              <input 
-                type="password" 
-                placeholder="Paste Supabase JWT..." 
-                value={token} 
-                onChange={handleTokenChange}
-                style={{
-                  background: 'var(--bg-elevated)',
-                  border: '1px solid var(--border-color)',
-                  color: 'var(--text-primary)',
-                  borderRadius: 'var(--border-radius-sm)',
-                  padding: '0.5rem 1rem',
-                  width: '240px',
-                  fontSize: '0.85rem'
-                }}
-              />
-              <button className="btn btn-secondary" onClick={activeTab === "briefing" ? fetchBriefing : fetchClients} disabled={loading || !token || activeTab === "onboard"} style={{ padding: '0.5rem 1.2rem', display: 'flex', gap: '0.5rem' }}>
+              {token ? (
+                <button className="btn btn-secondary" onClick={handleLogout} style={{ padding: '0.5rem 1.2rem' }}>
+                  🔒 Logout
+                </button>
+              ) : null}
+              <button 
+                className="btn btn-secondary" 
+                onClick={activeTab === "briefing" ? () => refetchBriefing() : () => refetchClients()} 
+                disabled={activeLoading || !token || activeTab === "onboard"} 
+                style={{ padding: '0.5rem 1.2rem', display: 'flex', gap: '0.5rem' }}
+              >
                 <span>🔄</span> Sync
               </button>
             </div>
-            {token && <span style={{ fontSize: '0.75rem', color: 'var(--success)' }}>✓ JWT credential token cached</span>}
+            {token && <span style={{ fontSize: '0.75rem', color: 'var(--success)' }}>✓ JWT credential session active</span>}
           </div>
         </header>
 
+        {/* Authentication Gateway */}
         {!token && (
-          <div className="card glass-panel" style={{ borderLeft: '4px solid var(--warning)', padding: '2.5rem', textAlign: 'center' }}>
-            <h3 style={{ color: 'var(--warning)', marginBottom: '0.75rem' }}>🔒 Secure Database Shield Active</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem', maxWidth: '600px', margin: '0 auto 1.5rem' }}>
-              This intelligence pipeline requires cryptographic tenant validation. Please paste your Supabase bearer JWT token in the password input above to decrypt client states.
-            </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem', maxWidth: '450px', margin: '3rem auto' }}>
+            {supabase ? (
+              <section className="card glass-panel" style={{ padding: '2rem' }}>
+                <h3 style={{ marginBottom: '1.25rem', textAlign: 'center' }} className="text-gradient">
+                  {authMode === "login" ? "Coach Login" : "Coach Sign Up"}
+                </h3>
+                <form onSubmit={handleSupabaseAuth} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                  <input 
+                    type="email" 
+                    placeholder="Coach Email Address" 
+                    required 
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    style={{
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border-color)',
+                      color: 'var(--text-primary)',
+                      borderRadius: 'var(--border-radius-sm)',
+                      padding: '0.6rem 1rem'
+                    }}
+                  />
+                  <input 
+                    type="password" 
+                    placeholder="Account Password" 
+                    required 
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    style={{
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border-color)',
+                      color: 'var(--text-primary)',
+                      borderRadius: 'var(--border-radius-sm)',
+                      padding: '0.6rem 1rem'
+                    }}
+                  />
+                  <button type="submit" className="btn btn-primary" style={{ padding: '0.7rem' }} disabled={authLoading}>
+                    {authLoading ? "Verifying..." : authMode === "login" ? "Login" : "Sign Up"}
+                  </button>
+                </form>
+                <div style={{ marginTop: '1rem', textAlign: 'center', fontSize: '0.85rem' }}>
+                  <button 
+                    onClick={() => setAuthMode(authMode === "login" ? "signup" : "login")}
+                    style={{ color: 'var(--accent-primary)', textDecoration: 'underline' }}
+                  >
+                    Switch to {authMode === "login" ? "Sign Up" : "Login"}
+                  </button>
+                </div>
+              </section>
+            ) : null}
+
+            {/* Manual JWT Bypass Panel (For Development & offline testing support) */}
+            <section className="card glass-panel" style={{ padding: '2rem', borderTop: '2px solid var(--accent-primary)' }}>
+              <h3 style={{ marginBottom: '0.75rem', textAlign: 'center' }}>🔒 Direct Token Bypass</h3>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.25rem', textAlign: 'center' }}>
+                No Supabase URL configured. Enter a direct JWT token payload here to bypass authentication routing.
+              </p>
+              <form onSubmit={handleManualTokenSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                <input 
+                  type="password" 
+                  placeholder="Paste Supabase bearer JWT..." 
+                  required 
+                  value={manualToken}
+                  onChange={(e) => setManualToken(e.target.value)}
+                  style={{
+                    background: 'var(--bg-elevated)',
+                    border: '1px solid var(--border-color)',
+                    color: 'var(--text-primary)',
+                    borderRadius: 'var(--border-radius-sm)',
+                    padding: '0.6rem 1rem',
+                    fontFamily: 'monospace',
+                    fontSize: '0.8rem'
+                  }}
+                />
+                <button type="submit" className="btn btn-secondary" style={{ padding: '0.6rem' }}>
+                  Apply Bypass Token
+                </button>
+              </form>
+            </section>
           </div>
         )}
 
-        {token && loading && (
-          <div style={{ color: 'var(--text-secondary)', padding: '3rem 0', textAlign: 'center' }}>
-            <p style={{ fontSize: '1.2rem' }}>Decrypting tenant database context and running metrics calculations...</p>
+        {token && activeLoading && (
+          <div style={{ color: 'var(--text-secondary)', padding: '5rem 0', textAlign: 'center' }}>
+            <div style={{ fontSize: '1.5rem', marginBottom: '0.5rem' }}>⏳ Querying Pipeline</div>
+            <p>Syncing tenant metadata states and analyzing active prediction models...</p>
           </div>
         )}
 
-        {token && error && activeTab !== "onboard" && (
+        {token && activeError && activeTab !== "onboard" && (
           <div className="card glass-panel" style={{ borderLeft: '4px solid var(--danger)', padding: '2rem' }}>
             <h3 style={{ color: 'var(--danger)', marginBottom: '0.5rem' }}>⚠️ Connection / Validation Refused</h3>
-            <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem' }}>{error}</p>
-            {error.includes("not registered as a coach") && (
+            <p style={{ color: 'var(--text-secondary)', marginBottom: '1rem' }}>{(activeError as Error).message}</p>
+            {((activeError as Error).message.includes("not registered as a coach") || (activeError as Error).message.includes("403")) && (
               <button className="btn btn-primary" onClick={() => setActiveTab("onboard")}>
                 Go to Onboarding Setup
               </button>
@@ -313,24 +465,25 @@ export default function Home() {
           </div>
         )}
 
-        {token && !loading && !error && activeTab === "briefing" && data && (
+        {/* tab 1: briefing view */}
+        {token && !activeLoading && !activeError && activeTab === "briefing" && briefingData && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
               <div className="card glass-panel">
                 <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>REVENUE AT RISK</span>
-                <h2 style={{ fontSize: '2rem', color: data.revenue_at_risk > 0 ? 'var(--danger)' : 'var(--success)' }}>
-                  ${data.revenue_at_risk.toFixed(2)}
+                <h2 style={{ fontSize: '2rem', color: briefingData.revenue_at_risk > 0 ? 'var(--danger)' : 'var(--success)' }}>
+                  ${briefingData.revenue_at_risk.toFixed(2)}
                 </h2>
               </div>
               <div className="card glass-panel">
                 <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>ACTIVE COMPOSITE ALERTS</span>
-                <h2 style={{ fontSize: '2rem', color: data.active_signals_count > 0 ? 'var(--warning)' : 'var(--text-primary)' }}>
-                  {data.active_signals_count}
+                <h2 style={{ fontSize: '2rem', color: briefingData.active_signals_count > 0 ? 'var(--warning)' : 'var(--text-primary)' }}>
+                  {briefingData.active_signals_count}
                 </h2>
               </div>
               <div className="card glass-panel">
                 <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>PENDING STRATEGIC ACTIONS</span>
-                <h2 style={{ fontSize: '2rem' }}>{data.pending_actions_count}</h2>
+                <h2 style={{ fontSize: '2rem' }}>{briefingData.pending_actions_count}</h2>
               </div>
             </div>
 
@@ -339,18 +492,18 @@ export default function Home() {
                 <span>📖</span> AI Daily Summary
               </h3>
               <div className="briefing-box" style={{ fontSize: '1.05rem', color: 'var(--text-secondary)' }}>
-                {data.briefing}
+                {briefingData.briefing}
               </div>
             </section>
 
-            {data.urgent_alerts.length > 0 && (
+            {briefingData.urgent_alerts.length > 0 && (
               <section style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 <h3 style={{ fontSize: '1.3rem', display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                   <span>⚠️</span> Action Required: High Priority Interventions
                 </h3>
                 
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '1rem' }}>
-                  {data.urgent_alerts.map((alert, index) => (
+                  {briefingData.urgent_alerts.map((alert, index) => (
                     <div key={index} className="card glass-panel flex-between" style={{ borderLeft: `4px solid ${alert.severity === 'high' ? 'var(--danger)' : 'var(--warning)'}`, flexDirection: 'row', padding: '1.5rem' }}>
                       <div>
                         <h4 style={{ fontSize: '1.1rem', marginBottom: '0.25rem' }}>{alert.client_name}</h4>
@@ -368,16 +521,16 @@ export default function Home() {
                             <button 
                               className="btn btn-primary" 
                               style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }} 
-                              disabled={actioningId === alert.action_id}
-                              onClick={() => handleUpdateAction(alert.action_id!, alert.client_name, "completed")}
+                              disabled={actionMutation.isPending}
+                              onClick={() => actionMutation.mutate({ actionId: alert.action_id!, status: "completed" })}
                             >
-                              {actioningId === alert.action_id ? "Executing..." : "Execute"}
+                              Execute
                             </button>
                             <button 
                               className="btn btn-secondary" 
                               style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }} 
-                              disabled={actioningId === alert.action_id}
-                              onClick={() => handleUpdateAction(alert.action_id!, alert.client_name, "rejected")}
+                              disabled={actionMutation.isPending}
+                              onClick={() => actionMutation.mutate({ actionId: alert.action_id!, status: "rejected" })}
                             >
                               Dismiss
                             </button>
@@ -392,8 +545,9 @@ export default function Home() {
           </div>
         )}
 
-        {token && !loading && !error && activeTab === "clients" && (
-          <section className="card glass-panel">
+        {/* tab 2: client list view */}
+        {token && !activeLoading && !activeError && activeTab === "clients" && (
+          <section className="card glass-panel animate-fade-in">
             <h3 className="card-title" style={{ marginBottom: '1.5rem' }}>Client Roster & Predictive Scores</h3>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}>
@@ -409,7 +563,7 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody>
-                  {clients.map((client) => (
+                  {clientsData.map((client: ClientListItem) => (
                     <tr key={client.client_id} style={{ borderBottom: '1px solid var(--border-color)', fontSize: '0.95rem' }}>
                       <td style={{ padding: '1rem', fontWeight: 600 }}>{client.name}</td>
                       <td style={{ padding: '1rem', color: 'var(--text-secondary)' }}>{client.email}</td>
@@ -434,11 +588,11 @@ export default function Home() {
                         </span>
                       </td>
                       <td style={{ padding: '1rem', color: client.days_since_checkin > 7 ? 'var(--danger)' : 'var(--text-secondary)' }}>
-                        {client.days_since_checkin} days
+                        {client.days_since_checkin >= 999 ? "Never checked in" : `${client.days_since_checkin} days`}
                       </td>
                     </tr>
                   ))}
-                  {clients.length === 0 && (
+                  {clientsData.length === 0 && (
                     <tr>
                       <td colSpan={7} style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-muted)' }}>
                         No clients registered under this account.
@@ -451,12 +605,13 @@ export default function Home() {
           </section>
         )}
 
-        {token && !loading && activeTab === "onboard" && (
+        {/* tab 3: onboarding coach form */}
+        {token && activeTab === "onboard" && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
-            <section className="card glass-panel" style={{ maxWidth: '650px' }}>
+            <section className="card glass-panel animate-fade-in" style={{ maxWidth: '650px' }}>
               <h3 className="card-title" style={{ marginBottom: '1.5rem' }}>Provision Coach Profile</h3>
               
-              <form onSubmit={handleRegisterCoach} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+              <form onSubmit={handleRegisterFormSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
                   <label style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Coach Full Name</label>
                   <input 
@@ -527,8 +682,13 @@ export default function Home() {
                   />
                 </div>
 
-                <button type="submit" className="btn btn-primary" style={{ padding: '0.75rem', width: '100%', marginTop: '0.5rem' }}>
-                  Register Profile & Generate Webhooks
+                <button 
+                  type="submit" 
+                  className="btn btn-primary" 
+                  style={{ padding: '0.75rem', width: '100%', marginTop: '0.5rem' }}
+                  disabled={onboardMutation.isPending}
+                >
+                  {onboardMutation.isPending ? "Provisioning Profile..." : "Register Profile & Generate Webhooks"}
                 </button>
               </form>
             </section>
