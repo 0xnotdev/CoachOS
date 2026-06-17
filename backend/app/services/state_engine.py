@@ -24,7 +24,6 @@ class EntityStateEngine:
         event_type = event.get('event_type')
         timestamp = event.get('timestamp')
         
-        # We define score modifiers and overrides
         deltas = {
             'engagement_score': 0,
             'compliance_score': 0,
@@ -39,7 +38,6 @@ class EntityStateEngine:
             deltas['revenue_health'] = -20
             deltas['engagement_score'] = -5
         elif event_type == 'payment_succeeded':
-            # Recovery Logic: A successful payment completely restores revenue health
             overrides['revenue_health'] = 100
             deltas['engagement_score'] = +10
             last_payment = timestamp
@@ -47,7 +45,6 @@ class EntityStateEngine:
             deltas['compliance_score'] = -5
             deltas['engagement_score'] = -2
         elif event_type == 'checkin_completed':
-            # Recovery logic: completed checkin restores compliance baseline significantly
             deltas['compliance_score'] = +15
             deltas['engagement_score'] = +10
             last_checkin = timestamp
@@ -60,67 +57,42 @@ class EntityStateEngine:
     async def _mutate_state(self, entity_id: str, deltas: Dict[str, int], overrides: Dict[str, int], last_checkin: str | None, last_payment: str | None):
         db = self._get_db()
         try:
-            # 1. Fetch current state or insert defaults
-            state_res = await asyncio.to_thread(
+            # Call atomic PL/pgSQL function to update scores inside the DB, preventing race conditions
+            await asyncio.to_thread(
+                lambda: db.rpc("mutate_entity_state", {
+                    "p_entity_id": entity_id,
+                    "p_entity_type": "client",
+                    "p_engagement_delta": deltas.get("engagement_score", 0),
+                    "p_compliance_delta": deltas.get("compliance_score", 0),
+                    "p_revenue_delta": deltas.get("revenue_health", 0),
+                    "p_engagement_override": overrides.get("engagement_score"),
+                    "p_compliance_override": overrides.get("compliance_score"),
+                    "p_revenue_override": overrides.get("revenue_health"),
+                    "p_last_checkin": last_checkin,
+                    "p_last_payment": last_payment
+                }).execute()
+            )
+
+            # Query updated state to ensure accurate snapshots
+            updated_res = await asyncio.to_thread(
                 lambda: db.table("entity_state").select("*").eq("entity_id", entity_id).execute()
             )
             
-            if not state_res.data:
-                current_state = {
+            if updated_res.data:
+                current_state = updated_res.data[0]
+                snapshot = {
                     "entity_id": entity_id,
-                    "entity_type": "client",
-                    "engagement_score": 100,
-                    "compliance_score": 100,
-                    "revenue_health": 100,
-                    "churn_probability": 0.0,
-                    "last_checkin": last_checkin,
-                    "last_payment": last_payment
+                    "date": datetime.utcnow().date().isoformat(),
+                    "state": {
+                        "engagement_score": current_state["engagement_score"],
+                        "compliance_score": current_state["compliance_score"],
+                        "revenue_health": current_state["revenue_health"],
+                        "churn_probability": current_state["churn_probability"]
+                    }
                 }
                 await asyncio.to_thread(
-                    lambda: db.table("entity_state").insert(current_state).execute()
+                    lambda: db.table("entity_snapshots").upsert(snapshot).execute()
                 )
-            else:
-                current_state = state_res.data[0]
-                
-                # Apply overrides first
-                for key, val in overrides.items():
-                    current_state[key] = val
-
-                # Apply deltas and bound to [0, 100]
-                for key, delta in deltas.items():
-                    if key in overrides:
-                        continue # Skip delta application if we overrode the value
-                    val = current_state.get(key, 100) + delta
-                    current_state[key] = max(0, min(100, val))
-                
-                if last_checkin:
-                    current_state['last_checkin'] = last_checkin
-                if last_payment:
-                    current_state['last_payment'] = last_payment
-                
-                current_state['updated_at'] = datetime.utcnow().isoformat()
-                
-                await asyncio.to_thread(
-                    lambda: db.table("entity_state")
-                    .update(current_state)
-                    .eq("entity_id", entity_id)
-                    .execute()
-                )
-
-            # 2. Persist to entity_snapshots for trend metrics
-            snapshot = {
-                "entity_id": entity_id,
-                "date": datetime.utcnow().date().isoformat(),
-                "state": {
-                    "engagement_score": current_state["engagement_score"],
-                    "compliance_score": current_state["compliance_score"],
-                    "revenue_health": current_state["revenue_health"],
-                    "churn_probability": current_state["churn_probability"]
-                }
-            }
-            await asyncio.to_thread(
-                lambda: db.table("entity_snapshots").upsert(snapshot).execute()
-            )
 
         except Exception as e:
             logger.error(f"Failed to update state engine for entity {entity_id}: {e}")

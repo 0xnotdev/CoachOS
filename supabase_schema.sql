@@ -41,10 +41,11 @@ CREATE TABLE programs (
     name VARCHAR(255) NOT NULL
 );
 
--- Secure Webhook endpoint token table (removes guessable coach UUID in URL)
+-- Secure Webhook endpoint token table with per-coach Stripe webhook secrets
 CREATE TABLE webhook_endpoints (
     webhook_token UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     coach_id UUID NOT NULL REFERENCES coaches(id),
+    stripe_webhook_secret VARCHAR(255), -- Support multiple coaches onboarding their own Stripe account
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -108,6 +109,7 @@ CREATE TABLE feature_store (
     message_response_time_avg FLOAT,
     workout_completion_rate FLOAT,
     weekly_weight_change FLOAT,
+    last_known_weight FLOAT,          -- Enables correct weekly weight change trend math
     coach_response_time_avg FLOAT,
     payment_retry_count INTEGER,
     program_adherence_rate FLOAT,
@@ -164,8 +166,6 @@ CREATE TABLE actions (
 -- ==========================================
 -- ROW-LEVEL SECURITY (RLS) POLICIES
 -- ==========================================
-
--- Enable RLS on core data tables
 ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
 ALTER TABLE coaches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
@@ -175,35 +175,29 @@ ALTER TABLE actions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entity_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feature_store ENABLE ROW LEVEL SECURITY;
 
--- 1. Coaches Policy: Coach can only query/view their own record
 CREATE POLICY coach_self_policy ON coaches 
     FOR ALL USING (person_id = auth.uid());
 
--- 2. Clients Policy: Coach can select/insert clients mapped to their coach ID
 CREATE POLICY client_scope_policy ON clients
     FOR ALL USING (
         coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
     );
 
--- 3. Webhook Endpoints Policy: Only authenticated coaches can configure endpoints
 CREATE POLICY webhook_endpoints_policy ON webhook_endpoints
     FOR ALL USING (
         coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
     );
 
--- 4. Signals Policy: Scoped strictly to Coach who owns the relation
 CREATE POLICY signals_coach_policy ON signals
     FOR ALL USING (
         coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
     );
 
--- 5. Actions Policy: Scoped to the Coach
 CREATE POLICY actions_coach_policy ON actions
     FOR ALL USING (
         coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
     );
 
--- 6. Entity State & Feature Store select permissions through clients association
 CREATE POLICY entity_state_scope_policy ON entity_state
     FOR SELECT USING (
         entity_id IN (
@@ -221,3 +215,54 @@ CREATE POLICY feature_store_scope_policy ON feature_store
             )
         )
     );
+
+-- ==========================================
+-- DATABASE ATOMIC MUTATION PL/PGSQL FUNCTIONS
+-- ==========================================
+CREATE OR REPLACE FUNCTION mutate_entity_state(
+    p_entity_id UUID,
+    p_entity_type VARCHAR,
+    p_engagement_delta INT,
+    p_compliance_delta INT,
+    p_revenue_delta INT,
+    p_engagement_override INT DEFAULT NULL,
+    p_compliance_override INT DEFAULT NULL,
+    p_revenue_override INT DEFAULT NULL,
+    p_last_checkin TIMESTAMPTZ DEFAULT NULL,
+    p_last_payment TIMESTAMPTZ DEFAULT NULL
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO entity_state (
+        entity_id, 
+        entity_type, 
+        engagement_score, 
+        compliance_score, 
+        revenue_health, 
+        last_checkin, 
+        last_payment
+    ) VALUES (
+        p_entity_id, 
+        p_entity_type, 
+        COALESCE(p_engagement_override, 100), 
+        COALESCE(p_compliance_override, 100), 
+        COALESCE(p_revenue_override, 100), 
+        p_last_checkin, 
+        p_last_payment
+    ) ON CONFLICT (entity_id) DO UPDATE SET
+        engagement_score = CASE 
+            WHEN p_engagement_override IS NOT NULL THEN p_engagement_override
+            ELSE GREATEST(0, LEAST(100, entity_state.engagement_score + COALESCE(p_engagement_delta, 0)))
+        END,
+        compliance_score = CASE 
+            WHEN p_compliance_override IS NOT NULL THEN p_compliance_override
+            ELSE GREATEST(0, LEAST(100, entity_state.compliance_score + COALESCE(p_compliance_delta, 0)))
+        END,
+        revenue_health = CASE 
+            WHEN p_revenue_override IS NOT NULL THEN p_revenue_override
+            ELSE GREATEST(0, LEAST(100, entity_state.revenue_health + COALESCE(p_revenue_delta, 0)))
+        END,
+        last_checkin = COALESCE(p_last_checkin, entity_state.last_checkin),
+        last_payment = COALESCE(p_last_payment, entity_state.last_payment),
+        updated_at = NOW();
+END;
+$$ LANGUAGE plpgsql;

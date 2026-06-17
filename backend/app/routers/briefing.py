@@ -15,21 +15,30 @@ async def get_current_coach_id(
 ) -> str:
     """
     Decodes and validates the Supabase JWT.
-    Resolves the Supabase auth user ID (sub claim) to a specific Coach UUID.
+    Enforces strict token validation and rejects missing authorization with a 401.
     """
-    DEFAULT_COACH_ID = "00000000-0000-0000-0000-000000000000"
-    
     if not authorization:
-        logger.warning("No Authorization token provided. Falling back to default testing credentials.")
-        return DEFAULT_COACH_ID
+        logger.warning("Unauthenticated request blocked. Missing Authorization header.")
+        raise HTTPException(status_code=401, detail="Authentication credentials required. Please provide a Bearer JWT.")
 
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid token format. Must start with 'Bearer '")
 
     token = authorization.split(" ")[1]
+    
+    # Secure token decoding using the dedicated JWT signing secret
+    jwt_secret = settings.SUPABASE_JWT_SECRET
+    if not jwt_secret:
+        logger.critical("SUPABASE_JWT_SECRET is not configured in settings. Auth verification blocked.")
+        raise HTTPException(status_code=500, detail="Authentication service configuration error.")
+
     try:
-        secret = settings.SUPABASE_KEY
-        decoded_payload = jwt.decode(token, secret, algorithms=["HS256"], options={"verify_aud": False})
+        decoded_payload = jwt.decode(
+            token, 
+            jwt_secret, 
+            algorithms=["HS256"], 
+            options={"verify_aud": False, "verify_signature": True}
+        )
         user_id = decoded_payload.get("sub")
         
         if not user_id:
@@ -44,7 +53,7 @@ async def get_current_coach_id(
         )
         
         if not coach_res.data:
-            logger.error(f"No Coach entity links to authenticated person {user_id}")
+            logger.error(f"No Coach entity links to authenticated user ID {user_id}")
             raise HTTPException(status_code=403, detail="Authenticated user is not registered as a coach")
             
         return coach_res.data[0]["id"]
@@ -74,7 +83,6 @@ async def get_coach_clients(current_coach_id: str = Depends(get_current_coach_id
     """
     db = supabase_service.get_client()
     try:
-        # 1. Fetch all clients of this coach
         clients_res = await asyncio.to_thread(
             lambda: db.table("clients")
             .select("id, person_id, status")
@@ -88,8 +96,6 @@ async def get_coach_clients(current_coach_id: str = Depends(get_current_coach_id
         client_records = clients_res.data
         person_ids = [c["person_id"] for c in client_records]
 
-        # 2. Concurrently fetch names, state scores, and feature store values
-        # Run query tasks concurrently via asyncio.gather
         persons_task = asyncio.to_thread(
             lambda: db.table("persons").select("id, name, email").in_("id", person_ids).execute()
         )
@@ -106,7 +112,6 @@ async def get_coach_clients(current_coach_id: str = Depends(get_current_coach_id
         states_map = {row["entity_id"]: row for row in (s_res.data or [])}
         features_map = {row["entity_id"]: row for row in (f_res.data or [])}
 
-        # 3. Assemble denormalized client list
         clients_list = []
         for client in client_records:
             pid = client["person_id"]

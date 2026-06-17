@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     # Supabase (Free Tier Database & Auth)
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
+    SUPABASE_JWT_SECRET: str = "" # Enforces true cryptographic signature decoding
 
     # Stripe
     STRIPE_API_KEY: str = ""

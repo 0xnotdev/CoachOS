@@ -39,18 +39,49 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<TabType>("briefing");
   const [data, setData] = useState<BriefingData | null>(null);
   const [clients, setClients] = useState<ClientListItem[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [actioningId, setActioningId] = useState<string | null>(null);
+  
+  // Real cryptographic token configuration state
+  const [token, setToken] = useState<string>("");
 
-  const DEFAULT_COACH_ID = "00000000-0000-0000-0000-000000000000";
   const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+  // Load token from localStorage on boot
+  useEffect(() => {
+    const savedToken = localStorage.getItem("supabase_jwt") || "";
+    setToken(savedToken);
+  }, []);
+
+  const handleTokenChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    setToken(value);
+    localStorage.setItem("supabase_jwt", value);
+  };
+
+  const getHeaders = () => {
+    return {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`
+    };
+  };
+
   const fetchBriefing = async () => {
+    if (!token) return;
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/api/v1/briefing/today?coach_id=${DEFAULT_COACH_ID}`);
+      const response = await fetch(`${API_URL}/api/v1/briefing/today`, {
+        headers: getHeaders()
+      });
+      
+      if (response.status === 401) {
+        throw new Error("Invalid or Expired JWT. Please verify your Supabase JWT secret.");
+      }
+      if (response.status === 403) {
+        throw new Error("Your user is not registered as a coach in the system database.");
+      }
       if (!response.ok) {
         throw new Error("Failed to retrieve synthesized briefing from backend.");
       }
@@ -64,10 +95,16 @@ export default function Home() {
   };
 
   const fetchClients = async () => {
+    if (!token) return;
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch(`${API_URL}/api/v1/briefing/clients?coach_id=${DEFAULT_COACH_ID}`);
+      const response = await fetch(`${API_URL}/api/v1/briefing/clients`, {
+        headers: getHeaders()
+      });
+      if (response.status === 401) {
+        throw new Error("Invalid or Expired JWT. Please check your token credentials.");
+      }
       if (!response.ok) {
         throw new Error("Failed to retrieve clients roster from backend.");
       }
@@ -83,19 +120,19 @@ export default function Home() {
   const handleExecuteAction = async (actionId: string, clientName: string) => {
     setActioningId(actionId);
     try {
-      const response = await fetch(`${API_URL}/api/v1/actions/${actionId}?coach_id=${DEFAULT_COACH_ID}`, {
+      const response = await fetch(`${API_URL}/api/v1/actions/${actionId}`, {
         method: "PATCH",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: getHeaders(),
         body: JSON.stringify({ status: "completed" })
       });
 
+      if (response.status === 401 || response.status === 403) {
+        throw new Error("Action execution rejected. Invalid authorization privileges.");
+      }
       if (!response.ok) {
         throw new Error("Failed to execute action in backend database.");
       }
 
-      // Optimistic UI update: Remove from local state
       if (data) {
         const updatedAlerts = data.urgent_alerts.filter(a => a.action_id !== actionId);
         setData({
@@ -113,13 +150,19 @@ export default function Home() {
     }
   };
 
+  // Sync state whenever tab or token changes
   useEffect(() => {
-    if (activeTab === "briefing") {
-      fetchBriefing();
+    if (token) {
+      if (activeTab === "briefing") {
+        fetchBriefing();
+      } else {
+        fetchClients();
+      }
     } else {
-      fetchClients();
+      setData(null);
+      setClients([]);
     }
-  }, [activeTab]);
+  }, [activeTab, token]);
 
   return (
     <div className="layout animate-fade-in">
@@ -152,7 +195,7 @@ export default function Home() {
 
       {/* Main Content */}
       <main className="main-content">
-        <header className="header flex-between">
+        <header className="header flex-between" style={{ alignItems: 'flex-start' }}>
           <div>
             <h1 className="page-title text-gradient">
               {activeTab === "briefing" ? "Morning Briefing" : "Client State Registry"}
@@ -162,31 +205,54 @@ export default function Home() {
             </p>
           </div>
           
-          <div className="header-actions">
-            <button className="btn btn-secondary" onClick={activeTab === "briefing" ? fetchBriefing : fetchClients} disabled={loading} style={{ padding: '0.5rem 1.2rem', display: 'flex', gap: '0.5rem' }}>
-              <span>🔄</span> {loading ? "Syncing..." : "Sync Pipeline"}
-            </button>
-            <div className="avatar">JD</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', alignItems: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+              <input 
+                type="password" 
+                placeholder="Paste Supabase JWT..." 
+                value={token} 
+                onChange={handleTokenChange}
+                style={{
+                  background: 'var(--bg-elevated)',
+                  border: '1px solid var(--border-color)',
+                  color: 'var(--text-primary)',
+                  borderRadius: 'var(--border-radius-sm)',
+                  padding: '0.5rem 1rem',
+                  width: '240px',
+                  fontSize: '0.85rem'
+                }}
+              />
+              <button className="btn btn-secondary" onClick={activeTab === "briefing" ? fetchBriefing : fetchClients} disabled={loading || !token} style={{ padding: '0.5rem 1.2rem', display: 'flex', gap: '0.5rem' }}>
+                <span>🔄</span> Sync
+              </button>
+            </div>
+            {token && <span style={{ fontSize: '0.75rem', color: 'var(--success)' }}>✓ JWT credential token cached</span>}
           </div>
         </header>
 
-        {loading && (
-          <div style={{ color: 'var(--text-secondary)', padding: '3rem 0', textAlign: 'center' }}>
-            <p style={{ fontSize: '1.2rem' }}>Fetching real-time business context and rebuilding intelligence store...</p>
-          </div>
-        )}
-
-        {error && (
-          <div className="card glass-panel" style={{ borderLeft: '4px solid var(--danger)', padding: '2rem' }}>
-            <h3 style={{ color: 'var(--danger)', marginBottom: '0.5rem' }}>⚠️ Pipeline Connection Error</h3>
-            <p style={{ color: 'var(--text-secondary)' }}>{error}</p>
-            <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)', marginTop: '1rem' }}>
-              Ensure your FastAPI backend is running locally or deployed, and credentials for Supabase and Gemini are set in settings.
+        {!token && (
+          <div className="card glass-panel" style={{ borderLeft: '4px solid var(--warning)', padding: '2.5rem', textAlign: 'center' }}>
+            <h3 style={{ color: 'var(--warning)', marginBottom: '0.75rem' }}>🔒 Secure Database Shield Active</h3>
+            <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem', maxWidth: '600px', margin: '0 auto 1.5rem' }}>
+              This intelligence pipeline requires cryptographic tenant validation. Please paste your Supabase bearer JWT token in the password input above to decrypt client states.
             </p>
           </div>
         )}
 
-        {!loading && !error && activeTab === "briefing" && data && (
+        {token && loading && (
+          <div style={{ color: 'var(--text-secondary)', padding: '3rem 0', textAlign: 'center' }}>
+            <p style={{ fontSize: '1.2rem' }}>Decrypting tenant database context and running metrics calculations...</p>
+          </div>
+        )}
+
+        {token && error && (
+          <div className="card glass-panel" style={{ borderLeft: '4px solid var(--danger)', padding: '2rem' }}>
+            <h3 style={{ color: 'var(--danger)', marginBottom: '0.5rem' }}>⚠️ Connection / Validation Refused</h3>
+            <p style={{ color: 'var(--text-secondary)' }}>{error}</p>
+          </div>
+        )}
+
+        {token && !loading && !error && activeTab === "briefing" && data && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
             {/* KPI Banner metrics */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
@@ -258,7 +324,7 @@ export default function Home() {
           </div>
         )}
 
-        {!loading && !error && activeTab === "clients" && (
+        {token && !loading && !error && activeTab === "clients" && (
           <section className="card glass-panel">
             <h3 className="card-title" style={{ marginBottom: '1.5rem' }}>Client Roster & Predictive Scores</h3>
             <div style={{ overflowX: 'auto' }}>

@@ -36,6 +36,7 @@ class FeatureStoreService:
                 "message_response_time_avg": 0.0,
                 "workout_completion_rate": 1.0,
                 "weekly_weight_change": 0.0,
+                "last_known_weight": None,
                 "coach_response_time_avg": 0.0,
                 "payment_retry_count": 0,
                 "program_adherence_rate": 1.0
@@ -57,8 +58,17 @@ class FeatureStoreService:
             elif event_type == "workout_missed":
                 features["program_adherence_rate"] = max(0.0, features.get("program_adherence_rate", 1.0) * 0.9)
             
+            # Mathematical correction for weekly_weight_change
             if "weight" in payload:
-                features["weekly_weight_change"] = payload["weight"] - features.get("weekly_weight_change", 0.0)
+                new_weight = float(payload["weight"])
+                last_weight = features.get("last_known_weight")
+                
+                if last_weight is not None:
+                    features["weekly_weight_change"] = new_weight - float(last_weight)
+                else:
+                    features["weekly_weight_change"] = 0.0
+                    
+                features["last_known_weight"] = new_weight
 
             features["updated_at"] = datetime.utcnow().isoformat()
             
@@ -70,7 +80,6 @@ class FeatureStoreService:
             logger.error(f"Failed to update feature store for entity {entity_id}: {e}")
 
     def _upsert_features_batch(self, entity_id: str, days_since_checkin: int, days_since_payment: int, updated_at: str):
-        """Helper to run DB operations cleanly outside closure scopes"""
         db = self._get_db()
         db.table("feature_store").upsert({
             "entity_id": entity_id,
@@ -83,7 +92,6 @@ class FeatureStoreService:
         """
         Scheduled daily batch job that increments 'days_since_checkin' and 'days_since_payment'
         based on the last event timestamps stored in entity_state.
-        Corrects late-binding lambda closure reference bugs.
         """
         db = self._get_db()
         try:
@@ -113,7 +121,6 @@ class FeatureStoreService:
                     last_payment = datetime.fromisoformat(last_payment_str.replace("Z", "+00:00"))
                     days_since_payment = (now.date() - last_payment.date()).days
 
-                # Call helper directly passing loop values to avoid lambda closures
                 await asyncio.to_thread(
                     self._upsert_features_batch,
                     entity_id,
