@@ -23,6 +23,7 @@ class EntityStateEngine:
         entity_id = event.get('entity_id')
         event_type = event.get('event_type')
         timestamp = event.get('timestamp')
+        coach_id = event.get('coach_id')
         
         deltas = {
             'engagement_score': 0,
@@ -52,15 +53,28 @@ class EntityStateEngine:
             overrides['revenue_health'] = 0
             deltas['engagement_score'] = -30
 
-        await self._mutate_state(entity_id, deltas, overrides, last_checkin, last_payment)
+        # If coach_id is not present directly in the event, fetch it from clients table
+        if not coach_id:
+            db = self._get_db()
+            client_res = await asyncio.to_thread(
+                lambda: db.table("clients")
+                .select("coach_id")
+                .eq("person_id", entity_id)
+                .execute()
+            )
+            if client_res.data:
+                coach_id = client_res.data[0]["coach_id"]
 
-    async def _mutate_state(self, entity_id: str, deltas: Dict[str, int], overrides: Dict[str, int], last_checkin: str | None, last_payment: str | None):
+        await self._mutate_state(entity_id, str(coach_id) if coach_id else None, deltas, overrides, last_checkin, last_payment)
+
+    async def _mutate_state(self, entity_id: str, coach_id: str | None, deltas: Dict[str, int], overrides: Dict[str, int], last_checkin: str | None, last_payment: str | None):
         db = self._get_db()
         try:
             # Call atomic PL/pgSQL function to update scores inside the DB, preventing race conditions
             await asyncio.to_thread(
                 lambda: db.rpc("mutate_entity_state", {
                     "p_entity_id": entity_id,
+                    "p_coach_id": coach_id,
                     "p_entity_type": "client",
                     "p_engagement_delta": deltas.get("engagement_score", 0),
                     "p_compliance_delta": deltas.get("compliance_score", 0),
@@ -82,6 +96,7 @@ class EntityStateEngine:
                 current_state = updated_res.data[0]
                 snapshot = {
                     "entity_id": entity_id,
+                    "coach_id": coach_id,
                     "date": datetime.utcnow().date().isoformat(),
                     "state": {
                         "engagement_score": current_state["engagement_score"],

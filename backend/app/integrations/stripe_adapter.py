@@ -59,12 +59,13 @@ class StripeAdapter:
                 "source": "stripe",
                 "external_id": external_id,
                 "payload": stripe_event,
+                "coach_id": coach_id,
                 "occurred_at": datetime.fromtimestamp(stripe_event.get("created", datetime.utcnow().timestamp())).isoformat()
             }).execute()
         )
         raw_event_id = raw_event_insert.data[0]["id"]
-
-        # 3. Resolve Identity
+        
+        # ... Rest of client resolution ...
         data_object = stripe_event.get("data", {}).get("object", {})
         customer_id = data_object.get("customer")
         
@@ -106,6 +107,15 @@ class StripeAdapter:
             person_id = await identity_service.get_or_create_person(email, name)
             await identity_service.link_identity(person_id, "stripe", customer_id)
 
+        # Ensure that client relationship is created if it does not already exist
+        await asyncio.to_thread(
+            lambda: db.table("clients").upsert({
+                "person_id": str(person_id),
+                "coach_id": coach_id,
+                "status": "active"
+            }, on_conflict="person_id,coach_id").execute()
+        )
+
         # 4. Map and Normalize to Canonical Event
         event_type = stripe_event.get("type")
         canonical_type = "payment_unknown"
@@ -143,6 +153,7 @@ class StripeAdapter:
         canonical_insert = await asyncio.to_thread(
             lambda: db.table("canonical_events").insert({
                 "id": str(validation_event.event_id),
+                "coach_id": str(validation_event.coach_id),
                 "entity_type": validation_event.entity_type.value,
                 "entity_id": str(validation_event.entity_id),
                 "event_domain": validation_event.event_domain.value,
@@ -152,6 +163,7 @@ class StripeAdapter:
                 "raw_event_id": str(raw_event_id)
             }).execute()
         )
+
         
         return canonical_insert.data[0]
 

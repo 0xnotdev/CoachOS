@@ -1,7 +1,7 @@
 import asyncio
 from typing import Dict, Any, List
 from app.services.supabase_client import supabase_service
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,22 +17,35 @@ class SignalEngine:
 
     async def evaluate_signals(self, entity_id: str, coach_id: str):
         """
-        Runs deterministic rule evaluations on the Feature Store to extract composite signals.
+        Runs deterministic rule evaluations on features and state to extract composite signals.
         """
         db = self._get_db()
         try:
-            # 1. Fetch current features
-            feat_res = await asyncio.to_thread(
+            # 1. Fetch current features & state in parallel
+            feat_task = asyncio.to_thread(
                 lambda: db.table("feature_store").select("*").eq("entity_id", entity_id).execute()
             )
+            state_task = asyncio.to_thread(
+                lambda: db.table("entity_state").select("last_checkin").eq("entity_id", entity_id).execute()
+            )
+            
+            feat_res, state_res = await asyncio.gather(feat_task, state_task)
             
             if not feat_res.data:
                 return
 
             features = feat_res.data[0]
             
-            # Rule 1: Engagement Collapse (injects failed payment amount to estimate revenue at risk)
-            if features.get("payment_retry_count", 0) > 1 and features.get("days_since_checkin", 0) > 7:
+            # Calculate days_since_checkin dynamically from state timestamp
+            days_since_checkin = 999
+            if state_res.data and state_res.data[0].get("last_checkin"):
+                last_checkin_str = state_res.data[0]["last_checkin"]
+                last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                days_since_checkin = max(0, (now - last_checkin).days)
+
+            # Rule 1: Engagement Collapse
+            if features.get("payment_retry_count", 0) > 1 and days_since_checkin > 7:
                 await self._trigger_signal(
                     coach_id=coach_id,
                     entity_id=entity_id,
@@ -41,7 +54,7 @@ class SignalEngine:
                     confidence=0.85,
                     evidence={
                         "payment_retry_count": features["payment_retry_count"], 
-                        "days_since_checkin": features["days_since_checkin"],
+                        "days_since_checkin": days_since_checkin,
                         "amount": features.get("last_failed_payment_amount", 0.0)
                     }
                 )

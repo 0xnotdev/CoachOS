@@ -80,12 +80,28 @@ async def get_coach_clients(
         states_map = {row["entity_id"]: row for row in (s_res.data or [])}
         features_map = {row["entity_id"]: row for row in (f_res.data or [])}
 
+        from datetime import datetime, timezone
         clients_list = []
         for client in client_records:
             pid = client["person_id"]
             person = persons_map.get(pid, {})
             state = states_map.get(pid, {})
-            features = features_map.get(pid, {})
+
+            # Compute days_since dynamically from last event timestamps
+            last_checkin_str = state.get("last_checkin")
+            last_payment_str = state.get("last_payment")
+            
+            days_since_checkin = 999
+            days_since_payment = 999
+            now = datetime.now(timezone.utc)
+            
+            if last_checkin_str:
+                last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
+                days_since_checkin = max(0, (now - last_checkin).days)
+                
+            if last_payment_str:
+                last_payment = datetime.fromisoformat(last_payment_str.replace("Z", "+00:00"))
+                days_since_payment = max(0, (now - last_payment).days)
 
             clients_list.append({
                 "client_id": client["id"],
@@ -97,9 +113,10 @@ async def get_coach_clients(
                 "compliance_score": state.get("compliance_score", 100),
                 "revenue_health": state.get("revenue_health", 100),
                 "churn_probability": state.get("churn_probability", 0.0),
-                "days_since_checkin": features.get("days_since_checkin", 0),
-                "days_since_payment": features.get("days_since_payment", 0)
+                "days_since_checkin": days_since_checkin,
+                "days_since_payment": days_since_payment
             })
+
 
         return clients_list
 

@@ -47,22 +47,9 @@ async def lifespan(app: FastAPI):
     await task_queue.start_worker()
     logger.info("Durable SQLite Task Queue worker started.")
 
-    scheduler.add_job(
-        feature_store_service.cron_recalculate_time_deltas,
-        "interval",
-        days=1,
-        id="cron_recalculate_time_deltas"
-    )
-    
-    scheduler.add_job(
-        feature_store_service.cron_recalculate_time_deltas,
-        "date",
-        run_date=datetime.now() + timedelta(seconds=30),
-        id="initial_recalculate_time_deltas"
-    )
-    
     scheduler.start()
-    logger.info("APScheduler initialized: Daily cron scheduled (with 30s deferred initial run).")
+    logger.info("APScheduler initialized.")
+
     
     yield
     

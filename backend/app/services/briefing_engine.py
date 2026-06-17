@@ -107,6 +107,14 @@ class BriefingEngine:
                 if sig["signal_type"] == "engagement_collapse":
                     revenue_at_risk += amount_failed
 
+                # Compute days_since_checkin dynamically
+                last_checkin_str = state.get("last_checkin")
+                days_since_checkin = 999
+                now = datetime.now(timezone.utc)
+                if last_checkin_str:
+                    last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
+                    days_since_checkin = max(0, (now - last_checkin).days)
+
                 rich_sig = {
                     "client_name": p_name,
                     "client_email": p_email,
@@ -115,9 +123,10 @@ class BriefingEngine:
                     "confidence": sig["confidence"],
                     "compliance_score": state.get("compliance_score", 100),
                     "engagement_score": state.get("engagement_score", 100),
-                    "days_since_checkin": features.get("days_since_checkin", 0),
+                    "days_since_checkin": days_since_checkin,
                     "payment_retry_count": features.get("payment_retry_count", 0),
                 }
+
                 rich_signals.append(rich_sig)
                 
                 # Pair accurately using signal_id link instead of generic positional entity matches
