@@ -331,3 +331,18 @@ BEGIN
         updated_at = NOW();
 END;
 $$ LANGUAGE plpgsql;
+
+-- briefings table to cache daily briefings with a TTL check
+CREATE TABLE briefings (
+    coach_id UUID PRIMARY KEY REFERENCES coaches(id),
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    briefing_content JSONB NOT NULL
+);
+
+ALTER TABLE briefings ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY briefings_coach_policy ON briefings
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
+    );
+

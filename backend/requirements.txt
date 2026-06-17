@@ -13,3 +13,6 @@ pytest==7.4.3
 pyjwt==2.8.0
 apscheduler==3.10.4
 cryptography>=40.0.0
+structlog==26.1.0
+sentry-sdk==2.63.0
+slowapi==0.1.10

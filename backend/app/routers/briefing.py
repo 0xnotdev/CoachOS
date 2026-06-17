@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from app.services.briefing_engine import briefing_engine
 from app.services.supabase_client import supabase_service
 from app.dependencies.auth import get_current_coach_id
+from app.utils.rate_limiter import limiter
 import asyncio
 import logging
 
@@ -9,7 +10,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.get("/today")
-async def get_today_briefing(current_coach_id: str = Depends(get_current_coach_id)):
+@limiter.limit("5/minute")
+async def get_today_briefing(
+    request: Request,
+    current_coach_id: str = Depends(get_current_coach_id)
+):
     try:
         briefing_payload = await briefing_engine.generate_daily_briefing(current_coach_id)
         return briefing_payload
@@ -18,7 +23,11 @@ async def get_today_briefing(current_coach_id: str = Depends(get_current_coach_i
         raise HTTPException(status_code=500, detail="Failed to fetch briefing.")
 
 @router.get("/clients")
-async def get_coach_clients(current_coach_id: str = Depends(get_current_coach_id)):
+@limiter.limit("10/minute")
+async def get_coach_clients(
+    request: Request,
+    current_coach_id: str = Depends(get_current_coach_id)
+):
     """
     Returns all clients under the authenticated coach joined with state and feature metrics.
     Correctly paginates queries via .range() limit boundaries to scale past database defaults.

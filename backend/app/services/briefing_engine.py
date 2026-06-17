@@ -3,6 +3,7 @@ import json
 from typing import Dict, Any, List
 from app.services.supabase_client import supabase_service
 from app.config import settings
+from datetime import datetime, timedelta, timezone
 import litellm
 import logging
 
@@ -21,10 +22,30 @@ class BriefingEngine:
         """
         Gathers raw metrics, active signals, predictions, and proposed actions,
         and uses Gemini 1.5/2.5 Flash to synthesize a narrative daily briefing.
+        Caches results in Supabase briefings table with a 30-minute TTL to reduce token costs.
         """
         db = self._get_db()
         try:
-            # 1. Fetch active signals
+            # 1. Check Cache Layer First
+            cache_res = await asyncio.to_thread(
+                lambda: db.table("briefings")
+                .select("generated_at, briefing_content")
+                .eq("coach_id", coach_id)
+                .execute()
+            )
+            
+            if cache_res.data:
+                cached = cache_res.data[0]
+                generated_at = datetime.fromisoformat(cached["generated_at"].replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                if now - generated_at < timedelta(minutes=30):
+                    logger.info(f"Returning cached daily briefing for Coach {coach_id} (generated_at: {cached['generated_at']})")
+                    return cached["briefing_content"]
+
+            # Cache miss or expired: Generate a fresh briefing
+            logger.info(f"Cache miss for Coach {coach_id}. Querying metrics & invoking LLM...")
+
+            # 2. Fetch active signals
             sig_res = await asyncio.to_thread(
                 lambda: db.table("signals")
                 .select("*")
@@ -34,7 +55,7 @@ class BriefingEngine:
             )
             signals = sig_res.data or []
             
-            # 2. Fetch pending actions
+            # 3. Fetch pending actions
             act_res = await asyncio.to_thread(
                 lambda: db.table("actions")
                 .select("*")
@@ -44,7 +65,7 @@ class BriefingEngine:
             )
             actions = act_res.data or []
 
-            # 3. Fetch auxiliary entities (persons, features, states) to build rich context
+            # 4. Fetch auxiliary entities (persons, features, states) to build rich context
             entity_ids = list(set([s["entity_id"] for s in signals] + [a["entity_id"] for a in actions]))
             
             persons_map = {}
@@ -67,7 +88,7 @@ class BriefingEngine:
                 )
                 features_map = {row["entity_id"]: row for row in (f_res.data or [])}
 
-            # 4. Compile rich context list for LLM prompt
+            # 5. Compile rich context list for LLM prompt
             rich_signals = []
             revenue_at_risk = 0.0
             urgent_alerts = []
@@ -133,13 +154,27 @@ class BriefingEngine:
                 )
                 narrative = response.choices[0].message.content
 
-            return {
+            briefing_payload = {
                 "briefing": narrative,
                 "urgent_alerts": urgent_alerts,
                 "revenue_at_risk": revenue_at_risk,
                 "active_signals_count": len(signals),
                 "pending_actions_count": len(actions)
             }
+
+            # Save generated briefing to cache table (upsert based on coach_id)
+            await asyncio.to_thread(
+                lambda: db.table("briefings")
+                .upsert({
+                    "coach_id": coach_id,
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "briefing_content": briefing_payload
+                })
+                .execute()
+            )
+            logger.info(f"Daily briefing cached successfully for Coach {coach_id}")
+
+            return briefing_payload
 
         except Exception as e:
             logger.error(f"Failed to generate structured briefing: {e}")

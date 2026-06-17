@@ -3,13 +3,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.services.supabase_client import supabase_service
 from app.services.feature_store import feature_store_service
+from app.services.task_queue import task_queue
+from app.utils.logging import setup_logging, request_id_ctx
+from app.utils.rate_limiter import limiter
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, timedelta
 import logging
+import uuid
 
-logging.basicConfig(level=logging.INFO)
+# Initialize structured logging configurations
+setup_logging()
 logger = logging.getLogger(__name__)
+
+# Initialize Sentry monitoring if configuration key is active
+if getattr(settings, "SENTRY_DSN", None):
+    import sentry_sdk
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        traces_sample_rate=1.0,
+    )
+    logger.info("Sentry monitoring agent initialized successfully.")
 
 scheduler = AsyncIOScheduler()
 
@@ -17,6 +33,7 @@ scheduler = AsyncIOScheduler()
 async def lifespan(app: FastAPI):
     logger.info("Starting up CoachOS backend...")
     
+    # Verify Supabase configuration on boot
     if supabase_service.client:
         try:
             supabase_service.client.table("raw_events").select("id").limit(1).execute()
@@ -26,6 +43,10 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("Supabase Client not initialized. Running in Mock/Offline mode.")
         
+    # Start the SQLite-backed Durable Task Queue worker thread
+    await task_queue.start_worker()
+    logger.info("Durable SQLite Task Queue worker started.")
+
     scheduler.add_job(
         feature_store_service.cron_recalculate_time_deltas,
         "interval",
@@ -33,8 +54,6 @@ async def lifespan(app: FastAPI):
         id="cron_recalculate_time_deltas"
     )
     
-    # Schedule cron to run asynchronously 30 seconds after server startup,
-    # preventing server block and health check drop failures under load.
     scheduler.add_job(
         feature_store_service.cron_recalculate_time_deltas,
         "date",
@@ -49,6 +68,7 @@ async def lifespan(app: FastAPI):
     
     logger.info("Shutting down CoachOS backend...")
     scheduler.shutdown()
+    await task_queue.stop_worker()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -57,11 +77,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Bind slowapi rate limiter instance
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Enforce secure CORS policy configuration in production
 origins = settings.ALLOWED_ORIGINS_LIST
 allow_creds = True
 if "*" in origins:
-    allow_creds = False # Browser spec blocks credential transfer on wildcard origins
+    allow_creds = False
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,6 +94,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_request_id_middleware(request, call_next):
+    """
+    Middleware injecting unique request-id header mappings across context boundaries.
+    """
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    token = request_id_ctx.set(request_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        request_id_ctx.reset(token)
 
 @app.get("/health")
 async def health_check():

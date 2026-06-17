@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException, BackgroundTasks, Path
+from fastapi import APIRouter, Request, HTTPException, Path
 from app.integrations.stripe_adapter import stripe_adapter
 from app.services.state_engine import state_engine
 from app.services.feature_store import feature_store_service
@@ -6,6 +6,7 @@ from app.services.signal_engine import signal_engine
 from app.services.prediction_engine import prediction_engine
 from app.services.decision_engine import decision_engine
 from app.services.supabase_client import supabase_service
+from app.services.task_queue import task_queue, register_task
 from app.config import settings
 from app.utils.security import security_helper
 from uuid import UUID
@@ -44,10 +45,16 @@ async def execute_event_pipeline(canonical_event: dict, coach_id: str):
     except Exception as e:
         logger.error(f"CRITICAL: Event pipeline failed for entity {entity_id} under Coach {coach_id}: {e}", exc_info=True)
 
+@register_task("execute_event_pipeline")
+async def execute_event_pipeline_task(payload: dict, coach_id: str):
+    """
+    Durable task queue worker adapter for executing event pipelines.
+    """
+    await execute_event_pipeline(payload, coach_id)
+
 @router.post("/stripe/{webhook_token}")
 async def stripe_webhook(
     request: Request, 
-    background_tasks: BackgroundTasks,
     webhook_token: UUID = Path(..., description="The unique, unguessable webhook endpoint token registered for a coach")
 ):
     db = supabase_service.get_client()
@@ -88,8 +95,15 @@ async def stripe_webhook(
         canonical_event = await stripe_adapter.handle_webhook(payload, sig_header, str(coach_id), webhook_secret)
         
         if canonical_event:
-            background_tasks.add_task(execute_event_pipeline, canonical_event, str(coach_id))
-            logger.info(f"Stripe event queued for Coach {coach_id}: {canonical_event.get('event_type')}")
+            # Enqueue task in SQLite queue using canonical event UUID as task_id (guarantees idempotency)
+            task_id = canonical_event.get("id")
+            await task_queue.enqueue(
+                task_id=task_id,
+                task_name="execute_event_pipeline",
+                payload=canonical_event,
+                coach_id=str(coach_id)
+            )
+            logger.info(f"Stripe event queued in durable task queue for Coach {coach_id}: {canonical_event.get('event_type')}")
             
     except Exception as e:
         logger.error(f"Stripe webhook processing failed for Coach {coach_id}: {str(e)}")

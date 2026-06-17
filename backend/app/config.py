@@ -19,6 +19,8 @@ class Settings(BaseSettings):
 
     # Security Origins & Encryption
     ALLOWED_ORIGINS: str = "*"
+    SENTRY_DSN: str = ""
+
 
     @property
     def ALLOWED_ORIGINS_LIST(self) -> list[str]:
