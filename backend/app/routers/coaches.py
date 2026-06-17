@@ -24,7 +24,8 @@ async def register_new_coach(
 ):
     """
     Onboards a brand new coach using their Supabase JWT.
-    Checks if a coach already exists, otherwise provisions a person, coach, and webhook endpoint.
+    Corrects identity collisions by decoupling auth_user_id from persons.id.
+    Includes full recovery path to re-provision missing webhook endpoints on retry.
     """
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication credentials required. Please provide a Bearer JWT.")
@@ -50,18 +51,18 @@ async def register_new_coach(
 
         db = supabase_service.get_client()
 
-        # 1. Check if coach already registered
+        # 1. Check if coach already registered under this auth_user_id
         existing_coach = await asyncio.to_thread(
             lambda: db.table("coaches")
             .select("id, person_id")
-            .eq("person_id", user_id)
+            .eq("auth_user_id", user_id)
             .execute()
         )
         
         if existing_coach.data:
             coach_id = existing_coach.data[0]["id"]
             
-            # Fetch existing webhook endpoint
+            # Recovery path: Fetch existing webhook endpoint
             endpoint_res = await asyncio.to_thread(
                 lambda: db.table("webhook_endpoints")
                 .select("webhook_token")
@@ -69,7 +70,21 @@ async def register_new_coach(
                 .execute()
             )
             
-            webhook_url = f"{settings.API_V1_STR}/webhooks/stripe/{endpoint_res.data[0]['webhook_token']}" if endpoint_res.data else None
+            if not endpoint_res.data:
+                # Provision missing webhook endpoint on retry
+                webhook_token = str(uuid4())
+                await asyncio.to_thread(
+                    lambda: db.table("webhook_endpoints").insert({
+                        "webhook_token": webhook_token,
+                        "coach_id": coach_id,
+                        "stripe_webhook_secret": payload.stripe_webhook_secret
+                    }).execute()
+                )
+                logger.info(f"Recovered and provisioned missing webhook endpoint for coach {coach_id}")
+            else:
+                webhook_token = endpoint_res.data[0]['webhook_token']
+
+            webhook_url = f"{settings.API_V1_STR}/webhooks/stripe/{webhook_token}"
             
             return {
                 "message": "Coach already registered.",
@@ -86,22 +101,24 @@ async def register_new_coach(
         )
         
         if person_res.data:
+            # Reuses existing cross-system identity record, preventing email collision errors
             person_id = person_res.data[0]["id"]
         else:
-            # Create a new person record
+            # Create a new person record with a unique uuid
             new_person = await asyncio.to_thread(
                 lambda: db.table("persons").insert({
-                    "id": user_id, # Set person_id to match user_id directly
+                    "id": str(uuid4()),
                     "name": payload.name,
                     "email": payload.email
                 }).execute()
             )
             person_id = new_person.data[0]["id"]
 
-        # 3. Create the coaches record
+        # 3. Create the coaches record, binding auth_user_id to user_id (auth.uid())
         new_coach = await asyncio.to_thread(
             lambda: db.table("coaches").insert({
                 "person_id": person_id,
+                "auth_user_id": user_id,
                 "business_tier": payload.business_tier,
                 "stripe_connected_account_id": payload.stripe_connected_account_id
             }).execute()

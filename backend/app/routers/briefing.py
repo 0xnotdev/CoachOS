@@ -15,7 +15,7 @@ async def get_current_coach_id(
 ) -> str:
     """
     Decodes and validates the Supabase JWT.
-    Enforces strict token validation and rejects missing authorization with a 401.
+    Enforces strict token validation and resolves to coaches.auth_user_id.
     """
     if not authorization:
         logger.warning("Unauthenticated request blocked. Missing Authorization header.")
@@ -26,7 +26,6 @@ async def get_current_coach_id(
 
     token = authorization.split(" ")[1]
     
-    # Secure token decoding using the dedicated JWT signing secret
     jwt_secret = settings.SUPABASE_JWT_SECRET
     if not jwt_secret:
         logger.critical("SUPABASE_JWT_SECRET is not configured in settings. Auth verification blocked.")
@@ -48,7 +47,7 @@ async def get_current_coach_id(
         coach_res = await asyncio.to_thread(
             lambda: db.table("coaches")
             .select("id")
-            .eq("person_id", user_id)
+            .eq("auth_user_id", user_id)
             .execute()
         )
         

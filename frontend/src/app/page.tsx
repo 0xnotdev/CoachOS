@@ -86,7 +86,7 @@ export default function Home() {
         throw new Error("Invalid or Expired JWT. Please verify your Supabase credentials.");
       }
       if (response.status === 403) {
-        throw new Error("Your user is not registered as a coach. Please click 'Onboard Account' in the menu to provision your profile.");
+        throw new Error("Your user profile is not registered as a coach. Please register your account configuration.");
       }
       if (!response.ok) {
         throw new Error("Failed to retrieve briefing.");
@@ -112,7 +112,7 @@ export default function Home() {
         throw new Error("Invalid or Expired JWT.");
       }
       if (response.status === 403) {
-        throw new Error("Please onboard your coach profile first.");
+        throw new Error("Your user profile is not registered as a coach. Please register your account configuration.");
       }
       if (!response.ok) {
         throw new Error("Failed to retrieve client roster.");
@@ -298,7 +298,7 @@ export default function Home() {
           </div>
         )}
 
-        {token && !loading && activeTab === "briefing" && data && (
+        {token && !loading && !error && activeTab === "briefing" && data && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1.5rem' }}>
               <div className="card glass-panel">
@@ -367,7 +367,7 @@ export default function Home() {
           </div>
         )}
 
-        {token && !loading && activeTab === "clients" && (
+        {token && !loading && !error && activeTab === "clients" && (
           <section className="card glass-panel">
             <h3 className="card-title" style={{ marginBottom: '1.5rem' }}>Client Roster & Predictive Scores</h3>
             <div style={{ overflowX: 'auto' }}>
