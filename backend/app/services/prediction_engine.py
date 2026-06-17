@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 from typing import Dict, Any
 from app.services.supabase_client import supabase_service
 import math
@@ -17,8 +18,7 @@ class PredictionEngine:
 
     async def compute_predictions(self, entity_id: str):
         """
-        Calculates churn probabilities using a smooth, continuous sigmoid formula
-        and upserts the current active prediction to prevent database bloat.
+        Calculates churn probabilities using a smooth, continuous sigmoid formula.
         """
         db = self._get_db()
         try:
@@ -36,30 +36,32 @@ class PredictionEngine:
             adherence = features.get("program_adherence_rate", 1.0)
             retries = features.get("payment_retry_count", 0)
             
-            # Formula: weighted blend of adherence deficits and retry fatigue
             adherence_deficit = 1.0 - adherence
             payment_fatigue = 1.0 - (1.0 / (1.0 + retries))
             
-            # Smooth logistic scaling
             z = (adherence_deficit * 3.5) + (payment_fatigue * 4.0) - 2.5
             churn_prob = 1.0 / (1.0 + math.exp(-z))
             
-            # Bound strictly
             churn_prob = max(0.01, min(0.99, churn_prob))
 
-            # 3. Upsert prediction (maintaining 1 row per model/entity to prevent bloat)
+            # 3. Upsert prediction with updated_at refresh
+            now = datetime.utcnow().isoformat()
             await asyncio.to_thread(
                 lambda: db.table("predictions").upsert({
                     "entity_id": entity_id,
                     "model_name": "churn_model",
-                    "prediction_value": {"probability": churn_prob}
+                    "prediction_value": {"probability": churn_prob},
+                    "updated_at": now
                 }, on_conflict="entity_id,model_name").execute()
             )
             
             # Update entity_state
             await asyncio.to_thread(
                 lambda: db.table("entity_state")
-                .update({"churn_probability": churn_prob})
+                .update({
+                    "churn_probability": churn_prob,
+                    "updated_at": now
+                })
                 .eq("entity_id", entity_id)
                 .execute()
             )

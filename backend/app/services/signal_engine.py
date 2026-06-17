@@ -1,7 +1,7 @@
 import asyncio
 from typing import Dict, Any, List
 from app.services.supabase_client import supabase_service
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,6 @@ class SignalEngine:
         db = self._get_db()
         try:
             if event_type == "payment_succeeded":
-                # Resolve active engagement collapses
                 await asyncio.to_thread(
                     lambda: db.table("signals")
                     .update({"status": "resolved"})
@@ -74,7 +73,6 @@ class SignalEngine:
                 )
                 logger.info(f"Resolved engagement_collapse signals for entity {entity_id}")
             elif event_type == "checkin_completed":
-                # Resolve active transformation stalls if client checks in
                 await asyncio.to_thread(
                     lambda: db.table("signals")
                     .update({"status": "resolved"})
@@ -90,16 +88,13 @@ class SignalEngine:
     async def _trigger_signal(self, coach_id: str, entity_id: str, signal_type: str, severity: str, confidence: float, evidence: Dict[str, Any]):
         db = self._get_db()
         try:
-            # Deduplication: Check if an active signal of this type exists within the last 24h
-            time_boundary = (datetime.utcnow() - timedelta(hours=24)).isoformat()
-            
+            # Deduplication: Checks for any active signal of this type without a 24-hour limit
             existing = await asyncio.to_thread(
                 lambda: db.table("signals")
                 .select("id")
                 .eq("entity_id", entity_id)
                 .eq("signal_type", signal_type)
                 .eq("status", "active")
-                .gt("created_at", time_boundary)
                 .execute()
             )
             
@@ -119,4 +114,5 @@ class SignalEngine:
         except Exception as e:
             logger.error(f"Failed to record signal: {e}")
 
+# Global singleton
 signal_engine = SignalEngine()

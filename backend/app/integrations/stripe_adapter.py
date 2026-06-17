@@ -3,6 +3,7 @@ import asyncio
 from app.config import settings
 from app.services.supabase_client import supabase_service
 from app.services.identity import identity_service
+from app.models.events import CanonicalEvent, EntityType, EventDomain, IntegrationSource
 from datetime import datetime
 import logging
 from typing import Optional, Dict, Any
@@ -66,7 +67,6 @@ class StripeAdapter:
         person_id = await identity_service.resolve_identity("stripe", customer_id)
         
         if not person_id:
-            # Query Stripe Connect account ID from coaches record to isolate customer fetch context
             coach_res = await asyncio.to_thread(
                 lambda: db.table("coaches")
                 .select("stripe_connected_account_id")
@@ -80,7 +80,6 @@ class StripeAdapter:
             email = data_object.get("customer_email") or data_object.get("email")
             if not email and settings.STRIPE_API_KEY:
                 try:
-                    # Enforce Stripe Connect platform delegation headers to retrieve resource
                     customer = await asyncio.to_thread(
                         lambda: stripe.Customer.retrieve(
                             customer_id, 
@@ -102,7 +101,6 @@ class StripeAdapter:
         # 4. Map and Normalize to Canonical Event
         event_type = stripe_event.get("type")
         canonical_type = "payment_unknown"
-        domain = "revenue"
         
         amount = data_object.get("amount") or data_object.get("amount_due") or 0
         currency = data_object.get("currency") or "usd"
@@ -121,15 +119,30 @@ class StripeAdapter:
         elif event_type == "customer.subscription.deleted":
             canonical_type = "subscription_cancelled"
 
+        # 5. Enforce Canonical Schema Contract validation in Python
+        validation_event = CanonicalEvent(
+            event_id=UUID(raw_event_id),
+            coach_id=UUID(coach_id),
+            entity_type=EntityType.CLIENT,
+            entity_id=UUID(str(person_id)),
+            event_domain=EventDomain.REVENUE,
+            event_type=canonical_type,
+            source=IntegrationSource.STRIPE,
+            occurred_at=datetime.fromtimestamp(stripe_event.get("created")),
+            payload=structured_payload
+        )
+
+        # 6. Save to Database
         canonical_insert = await asyncio.to_thread(
             lambda: db.table("canonical_events").insert({
-                "entity_type": "client",
-                "entity_id": str(person_id),
-                "event_domain": domain,
-                "event_type": canonical_type,
-                "timestamp": datetime.fromtimestamp(stripe_event.get("created")).isoformat(),
-                "structured_payload": structured_payload,
-                "raw_event_id": raw_event_id
+                "id": str(validation_event.event_id),
+                "entity_type": validation_event.entity_type.value,
+                "entity_id": str(validation_event.entity_id),
+                "event_domain": validation_event.event_domain.value,
+                "event_type": validation_event.event_type,
+                "timestamp": validation_event.occurred_at.isoformat(),
+                "structured_payload": validation_event.payload,
+                "raw_event_id": str(validation_event.event_id)
             }).execute()
         )
         
