@@ -5,8 +5,10 @@ pydantic-settings==2.1.0
 supabase==2.3.0
 langgraph>=0.2.0
 langchain-core>=0.2.0
-litellm==1.31.2
+litellm>=1.45.0
 python-dotenv==1.0.0
 stripe==7.7.0
 httpx==0.25.2
 pytest==7.4.3
+pyjwt==2.8.0
+apscheduler==3.10.4

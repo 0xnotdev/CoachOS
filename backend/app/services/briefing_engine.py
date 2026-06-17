@@ -53,19 +53,16 @@ class BriefingEngine:
             features_map = {}
             
             if entity_ids:
-                # Fetch Person names
                 p_res = await asyncio.to_thread(
                     lambda: db.table("persons").select("id, name, email").in_("id", entity_ids).execute()
                 )
                 persons_map = {row["id"]: row for row in (p_res.data or [])}
 
-                # Fetch Entity States
                 s_res = await asyncio.to_thread(
                     lambda: db.table("entity_state").select("*").in_("entity_id", entity_ids).execute()
                 )
                 states_map = {row["entity_id"]: row for row in (s_res.data or [])}
 
-                # Fetch Feature Store
                 f_res = await asyncio.to_thread(
                     lambda: db.table("feature_store").select("*").in_("entity_id", entity_ids).execute()
                 )
@@ -102,15 +99,18 @@ class BriefingEngine:
                 }
                 rich_signals.append(rich_sig)
                 
+                # Map matching action suggested for UI execution triggers
+                matching_action = next((a for a in actions if a["entity_id"] == eid), None)
                 urgent_alerts.append({
+                    "action_id": matching_action["id"] if matching_action else None,
                     "client_name": p_name,
                     "signal_type": sig["signal_type"],
                     "severity": sig["severity"],
-                    "action_suggested": next((a["action_type"] for a in actions if a["entity_id"] == eid), "Monitor client closely")
+                    "action_suggested": matching_action["action_type"] if matching_action else "Monitor client closely"
                 })
 
             # Build narrative using async LiteLLM calls
-            narrative = "All metrics are stable. No active alerts or interventions required today."
+            narrative = "All client parameters are stable. No active alerts or interventions required today."
             
             if rich_signals or actions:
                 system_prompt = (
@@ -123,7 +123,6 @@ class BriefingEngine:
                 
                 user_prompt = f"Coach Business Daily Context:\n{json.dumps({'signals': rich_signals, 'suggested_actions': actions})}"
                 
-                # Native async LLM call
                 response = await litellm.acompletion(
                     model="gemini/gemini-1.5-flash",
                     api_key=settings.GEMINI_API_KEY,

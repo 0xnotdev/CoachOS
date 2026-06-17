@@ -53,12 +53,10 @@ class FeatureStoreService:
                 features["days_since_payment"] = 0
             elif event_type == "checkin_completed":
                 features["days_since_checkin"] = 0
-                # Exponential moving average for adherence
                 features["program_adherence_rate"] = min(1.0, features.get("program_adherence_rate", 1.0) * 0.9 + 0.1)
             elif event_type == "workout_missed":
                 features["program_adherence_rate"] = max(0.0, features.get("program_adherence_rate", 1.0) * 0.9)
             
-            # Example calculation of weight changes if weight is passed in checkin payload
             if "weight" in payload:
                 features["weekly_weight_change"] = payload["weight"] - features.get("weekly_weight_change", 0.0)
 
@@ -71,16 +69,26 @@ class FeatureStoreService:
         except Exception as e:
             logger.error(f"Failed to update feature store for entity {entity_id}: {e}")
 
+    def _upsert_features_batch(self, entity_id: str, days_since_checkin: int, days_since_payment: int, updated_at: str):
+        """Helper to run DB operations cleanly outside closure scopes"""
+        db = self._get_db()
+        db.table("feature_store").upsert({
+            "entity_id": entity_id,
+            "days_since_checkin": days_since_checkin,
+            "days_since_payment": days_since_payment,
+            "updated_at": updated_at
+        }).execute()
+
     async def cron_recalculate_time_deltas(self):
         """
         Scheduled daily batch job that increments 'days_since_checkin' and 'days_since_payment'
         based on the last event timestamps stored in entity_state.
+        Corrects late-binding lambda closure reference bugs.
         """
         db = self._get_db()
         try:
             logger.info("Running daily feature store time-delta recalculation cron...")
             
-            # Query all active states
             states = await asyncio.to_thread(
                 lambda: db.table("entity_state").select("entity_id, last_checkin, last_payment").execute()
             )
@@ -105,14 +113,13 @@ class FeatureStoreService:
                     last_payment = datetime.fromisoformat(last_payment_str.replace("Z", "+00:00"))
                     days_since_payment = (now.date() - last_payment.date()).days
 
-                # Upsert into Feature Store
+                # Call helper directly passing loop values to avoid lambda closures
                 await asyncio.to_thread(
-                    lambda: db.table("feature_store").upsert({
-                        "entity_id": entity_id,
-                        "days_since_checkin": max(0, days_since_checkin),
-                        "days_since_payment": max(0, days_since_payment),
-                        "updated_at": now.isoformat()
-                    }).execute()
+                    self._upsert_features_batch,
+                    entity_id,
+                    max(0, days_since_checkin),
+                    max(0, days_since_payment),
+                    now.isoformat()
                 )
             
             logger.info("Daily feature store time-delta recalculation completed.")

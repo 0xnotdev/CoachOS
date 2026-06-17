@@ -2,41 +2,12 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- ==========================================
--- LAYER 1: EVENT INGESTION
--- ==========================================
-CREATE TABLE raw_events (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    source VARCHAR(50) NOT NULL, -- stripe, trainerize, whatsapp, typeform
-    external_id VARCHAR(255) NOT NULL,
-    payload JSONB NOT NULL,
-    occurred_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_raw_events_source_ext ON raw_events(source, external_id);
-
--- ==========================================
--- LAYER 2: CANONICAL EVENT SYSTEM
--- ==========================================
-CREATE TABLE canonical_events (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    entity_type VARCHAR(50) NOT NULL, -- client, coach, lead
-    entity_id UUID NOT NULL,          -- maps to clients.id, etc.
-    event_domain VARCHAR(50) NOT NULL,
-    event_type VARCHAR(100) NOT NULL, -- payment_failed, workout_missed, message_received
-    timestamp TIMESTAMPTZ NOT NULL,
-    structured_payload JSONB,         -- Normalized context: {amount, currency, reason, etc.}
-    raw_event_id UUID REFERENCES raw_events(id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_canonical_events_entity ON canonical_events(entity_type, entity_id);
-
--- ==========================================
--- LAYER 3: IDENTITY RESOLUTION
+-- LAYER 3: IDENTITY RESOLUTION (Base Entities)
 -- ==========================================
 CREATE TABLE persons (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255),
-    email VARCHAR(255) UNIQUE,        -- Database-level uniqueness prevents identity race conditions
+    email VARCHAR(255) UNIQUE,
     phone VARCHAR(50),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -51,7 +22,6 @@ CREATE TABLE identities (
 );
 CREATE INDEX idx_identities_person ON identities(person_id);
 
--- DOMAIN ENTITIES
 CREATE TABLE coaches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     person_id UUID NOT NULL REFERENCES persons(id),
@@ -71,11 +41,44 @@ CREATE TABLE programs (
     name VARCHAR(255) NOT NULL
 );
 
+-- Secure Webhook endpoint token table (removes guessable coach UUID in URL)
+CREATE TABLE webhook_endpoints (
+    webhook_token UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    coach_id UUID NOT NULL REFERENCES coaches(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ==========================================
--- LAYER 4 & 5: ENTITY STATE & TEMPORAL INTELLIGENCE
+-- LAYER 1 & 2: INGESTION
+-- ==========================================
+CREATE TABLE raw_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source VARCHAR(50) NOT NULL,
+    external_id VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_raw_events_source_ext ON raw_events(source, external_id);
+
+CREATE TABLE canonical_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    entity_type VARCHAR(50) NOT NULL,
+    entity_id UUID NOT NULL,
+    event_domain VARCHAR(50) NOT NULL,
+    event_type VARCHAR(100) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    structured_payload JSONB,
+    raw_event_id UUID REFERENCES raw_events(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_canonical_events_entity ON canonical_events(entity_type, entity_id);
+
+-- ==========================================
+-- LAYER 4 & 5: STATE & TIMELINE
 -- ==========================================
 CREATE TABLE entity_state (
-    entity_id UUID PRIMARY KEY, -- client_id, coach_id, etc.
+    entity_id UUID PRIMARY KEY,
     entity_type VARCHAR(50) NOT NULL,
     engagement_score INTEGER DEFAULT 100,
     compliance_score INTEGER DEFAULT 100,
@@ -90,7 +93,7 @@ CREATE TABLE entity_snapshots (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     entity_id UUID NOT NULL,
     date DATE NOT NULL,
-    state JSONB NOT NULL, -- Snapshot of engagement, compliance, weight, etc.
+    state JSONB NOT NULL,
     UNIQUE(entity_id, date)
 );
 CREATE INDEX idx_entity_snapshots_entity_date ON entity_snapshots(entity_id, date DESC);
@@ -112,30 +115,31 @@ CREATE TABLE feature_store (
 );
 
 -- ==========================================
--- LAYER 8: SIGNAL DETECTION ENGINE
+-- LAYER 8: SIGNALS
 -- ==========================================
 CREATE TABLE signals (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     coach_id UUID REFERENCES coaches(id),
     entity_id UUID NOT NULL,
-    signal_type VARCHAR(100) NOT NULL, -- engagement_collapse, transformation_stall
-    severity VARCHAR(20) NOT NULL,     -- low, medium, high, critical
+    signal_type VARCHAR(100) NOT NULL,
+    severity VARCHAR(20) NOT NULL,
     confidence FLOAT NOT NULL,
-    evidence JSONB,                    -- Array of canonical_event IDs or feature values
-    status VARCHAR(50) DEFAULT 'active', -- active, resolved, dismissed
+    evidence JSONB,
+    status VARCHAR(50) DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_signals_entity_type ON signals(entity_id, signal_type);
 
 -- ==========================================
--- LAYER 7 & 9: PREDICTIONS & DECISIONS
+-- LAYER 7 & 9: PREDICTIONS
 -- ==========================================
 CREATE TABLE predictions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     entity_id UUID NOT NULL,
-    model_name VARCHAR(100) NOT NULL,  -- churn_model, expansion_model
-    prediction_value JSONB NOT NULL,   -- e.g., {"probability": 0.84}
+    model_name VARCHAR(100) NOT NULL,
+    prediction_value JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(entity_id, model_name)
 );
 CREATE INDEX idx_predictions_entity_created ON predictions(entity_id, created_at DESC);
@@ -145,14 +149,75 @@ CREATE INDEX idx_predictions_entity_created ON predictions(entity_id, created_at
 -- ==========================================
 CREATE TABLE actions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    entity_id UUID NOT NULL,           -- Who this action is for
+    entity_id UUID NOT NULL,
     coach_id UUID REFERENCES coaches(id),
-    priority INTEGER NOT NULL,         -- 0-100
-    action_type VARCHAR(100) NOT NULL, -- schedule_intervention, offer_upsell
-    reason JSONB NOT NULL,             -- Underlying signal or prediction
-    status VARCHAR(50) DEFAULT 'suggested', -- suggested, accepted, rejected, completed
-    actioned_by UUID,                  -- Coach or Agent that executed/dismissed the action
+    priority INTEGER NOT NULL,
+    action_type VARCHAR(100) NOT NULL,
+    reason JSONB NOT NULL,
+    status VARCHAR(50) DEFAULT 'suggested',
+    actioned_by UUID,
     actioned_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ==========================================
+-- ROW-LEVEL SECURITY (RLS) POLICIES
+-- ==========================================
+
+-- Enable RLS on core data tables
+ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE coaches ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_endpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE signals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE feature_store ENABLE ROW LEVEL SECURITY;
+
+-- 1. Coaches Policy: Coach can only query/view their own record
+CREATE POLICY coach_self_policy ON coaches 
+    FOR ALL USING (person_id = auth.uid());
+
+-- 2. Clients Policy: Coach can select/insert clients mapped to their coach ID
+CREATE POLICY client_scope_policy ON clients
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
+    );
+
+-- 3. Webhook Endpoints Policy: Only authenticated coaches can configure endpoints
+CREATE POLICY webhook_endpoints_policy ON webhook_endpoints
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
+    );
+
+-- 4. Signals Policy: Scoped strictly to Coach who owns the relation
+CREATE POLICY signals_coach_policy ON signals
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
+    );
+
+-- 5. Actions Policy: Scoped to the Coach
+CREATE POLICY actions_coach_policy ON actions
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE person_id = auth.uid())
+    );
+
+-- 6. Entity State & Feature Store select permissions through clients association
+CREATE POLICY entity_state_scope_policy ON entity_state
+    FOR SELECT USING (
+        entity_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE person_id = auth.uid()
+            )
+        )
+    );
+
+CREATE POLICY feature_store_scope_policy ON feature_store
+    FOR SELECT USING (
+        entity_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE person_id = auth.uid()
+            )
+        )
+    );
