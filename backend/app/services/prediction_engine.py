@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict, Any
 from app.services.supabase_client import supabase_service
+import math
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,8 +17,8 @@ class PredictionEngine:
 
     async def compute_predictions(self, entity_id: str):
         """
-        Runs ML models (XGBoost/LightGBM placeholders) on Feature Store values
-        to generate probabilities for churn, upsell, expansion, etc.
+        Calculates churn probabilities using a smooth, continuous sigmoid formula
+        and upserts the current active prediction to prevent database bloat.
         """
         db = self._get_db()
         try:
@@ -31,29 +32,31 @@ class PredictionEngine:
 
             features = feat_res.data[0]
 
-            # 2. Mock Churn Prediction (normally XGBoost model inference)
-            # High payment retries + low adherence increases churn risk
+            # 2. Continuous Sigmoid Churn Scoring (no cliff effects)
             adherence = features.get("program_adherence_rate", 1.0)
             retries = features.get("payment_retry_count", 0)
             
-            base_churn = 0.05
-            if adherence < 0.5:
-                base_churn += 0.45
-            if retries > 0:
-                base_churn += 0.30
+            # Formula: weighted blend of adherence deficits and retry fatigue
+            adherence_deficit = 1.0 - adherence
+            payment_fatigue = 1.0 - (1.0 / (1.0 + retries))
             
-            churn_prob = min(0.99, base_churn)
+            # Smooth logistic scaling
+            z = (adherence_deficit * 3.5) + (payment_fatigue * 4.0) - 2.5
+            churn_prob = 1.0 / (1.0 + math.exp(-z))
+            
+            # Bound strictly
+            churn_prob = max(0.01, min(0.99, churn_prob))
 
-            # Update predictions table
+            # 3. Upsert prediction (maintaining 1 row per model/entity to prevent bloat)
             await asyncio.to_thread(
-                lambda: db.table("predictions").insert({
+                lambda: db.table("predictions").upsert({
                     "entity_id": entity_id,
                     "model_name": "churn_model",
                     "prediction_value": {"probability": churn_prob}
-                }).execute()
+                }, on_conflict="entity_id,model_name").execute()
             )
             
-            # Update entity_state with the computed probability
+            # Update entity_state
             await asyncio.to_thread(
                 lambda: db.table("entity_state")
                 .update({"churn_probability": churn_prob})
@@ -61,7 +64,7 @@ class PredictionEngine:
                 .execute()
             )
             
-            logger.info(f"Generated predictions for {entity_id}: Churn Risk {churn_prob:.2f}")
+            logger.info(f"Updated churn prediction for {entity_id}: Churn Risk {churn_prob:.2f} (smooth)")
 
         except Exception as e:
             logger.error(f"Failed prediction generation for entity {entity_id}: {e}")

@@ -15,7 +15,7 @@ class StripeAdapter:
     def __init__(self):
         self.webhook_secret = settings.STRIPE_WEBHOOK_SECRET
 
-    async def handle_webhook(self, payload: bytes, sig_header: str) -> Optional[Dict[str, Any]]:
+    async def handle_webhook(self, payload: bytes, sig_header: str, coach_id: str) -> Optional[Dict[str, Any]]:
         """
         Parses webhook and triggers normalization, persistence, and identity resolution.
         """
@@ -23,7 +23,7 @@ class StripeAdapter:
             event = stripe.Webhook.construct_event(
                 payload, sig_header, self.webhook_secret
             )
-            return await self.process_stripe_event(event)
+            return await self.process_stripe_event(event, coach_id)
         except ValueError as e:
             logger.error("Invalid Stripe payload")
             raise e
@@ -31,7 +31,7 @@ class StripeAdapter:
             logger.error("Invalid Stripe signature")
             raise e
 
-    async def process_stripe_event(self, stripe_event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def process_stripe_event(self, stripe_event: Dict[str, Any], coach_id: str) -> Optional[Dict[str, Any]]:
         db = supabase_service.get_client()
         external_id = stripe_event.get("id")
         
@@ -68,39 +68,41 @@ class StripeAdapter:
 
         person_id = await identity_service.resolve_identity("stripe", customer_id)
         
-        # Identity Fallback / Creation
+        # Fallback & atomic identity resolution
         if not person_id:
-            # Try to fetch customer details to get email for fuzzy matching
             email = data_object.get("customer_email") or data_object.get("email")
             if not email and settings.STRIPE_API_KEY:
                 try:
                     customer = await asyncio.to_thread(stripe.Customer.retrieve, customer_id)
                     email = customer.get("email")
                 except Exception as e:
-                    logger.error(f"Failed to fetch Stripe customer: {e}")
+                    logger.error(f"Failed to fetch Stripe customer details: {e}")
 
-            if email:
-                # Fuzzy match in persons table
-                match = await asyncio.to_thread(
-                    lambda: db.table("persons").select("id").eq("email", email).execute()
-                )
-                if match.data:
-                    person_id = UUID(match.data[0]["id"])
-                    await identity_service.link_identity(person_id, "stripe", customer_id)
+            if not email:
+                # If email is totally unrecoverable, we insert a placeholder record for manual audit
+                email = f"unresolved_{customer_id}@coachos.internal"
+                logger.warning(f"Unable to retrieve client email for Stripe customer {customer_id}. Queueing for manual resolution.")
 
-            # Still no person? Create a new person record
-            if not person_id:
-                name = data_object.get("customer_name") or "Unknown Stripe Client"
-                new_person = await asyncio.to_thread(
-                    lambda: db.table("persons").insert({"name": name, "email": email}).execute()
-                )
-                person_id = UUID(new_person.data[0]["id"])
-                await identity_service.link_identity(person_id, "stripe", customer_id)
+            # Race-condition-guarded atomic client retrieval/creation
+            name = data_object.get("customer_name") or "Unknown Stripe Client"
+            person_id = await identity_service.get_or_create_person(email, name)
+            await identity_service.link_identity(person_id, "stripe", customer_id)
 
         # 4. Map and Normalize to Canonical Event
         event_type = stripe_event.get("type")
         canonical_type = "payment_unknown"
         domain = "revenue"
+        
+        # Extract structured payload contexts
+        amount = data_object.get("amount") or data_object.get("amount_due") or 0
+        currency = data_object.get("currency") or "usd"
+        reason = data_object.get("failure_reason") or data_object.get("reason") or "unknown"
+        
+        structured_payload = {
+            "amount": amount / 100.0, # Convert cents to standard float decimal
+            "currency": currency.upper(),
+            "reason": reason
+        }
 
         if event_type == "invoice.payment_failed":
             canonical_type = "payment_failed"
@@ -109,7 +111,7 @@ class StripeAdapter:
         elif event_type == "customer.subscription.deleted":
             canonical_type = "subscription_cancelled"
 
-        # Save Canonical Event
+        # Save Canonical Event (including structured payload for downstream feature logic)
         canonical_insert = await asyncio.to_thread(
             lambda: db.table("canonical_events").insert({
                 "entity_type": "client",
@@ -117,6 +119,7 @@ class StripeAdapter:
                 "event_domain": domain,
                 "event_type": canonical_type,
                 "timestamp": datetime.fromtimestamp(stripe_event.get("created")).isoformat(),
+                "structured_payload": structured_payload,
                 "raw_event_id": raw_event_id
             }).execute()
         )

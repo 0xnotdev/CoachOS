@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 class EntityStateEngine:
     def __init__(self):
-        # Checked lazily
         self.db = None
 
     def _get_db(self):
@@ -18,20 +17,21 @@ class EntityStateEngine:
 
     async def process_canonical_event(self, event: Dict[str, Any]):
         """
-        Updates the entity_state based on the business logic of the canonical event
-        and persists the snapshot into entity_snapshots.
+        Updates the entity_state based on event logic and persists the snapshot.
+        Enforces intelligent state recovery (e.g. successful payment fully resets revenue health).
         """
         entity_id = event.get('entity_id')
         event_type = event.get('event_type')
         timestamp = event.get('timestamp')
         
-        # Determine score deltas
+        # We define score modifiers and overrides
         deltas = {
             'engagement_score': 0,
             'compliance_score': 0,
             'revenue_health': 0
         }
         
+        overrides = {}
         last_checkin = None
         last_payment = None
 
@@ -39,23 +39,25 @@ class EntityStateEngine:
             deltas['revenue_health'] = -20
             deltas['engagement_score'] = -5
         elif event_type == 'payment_succeeded':
-            deltas['revenue_health'] = +10
+            # Recovery Logic: A successful payment completely restores revenue health
+            overrides['revenue_health'] = 100
+            deltas['engagement_score'] = +10
             last_payment = timestamp
         elif event_type == 'workout_missed':
             deltas['compliance_score'] = -5
             deltas['engagement_score'] = -2
         elif event_type == 'checkin_completed':
-            deltas['compliance_score'] = +5
-            deltas['engagement_score'] = +5
+            # Recovery logic: completed checkin restores compliance baseline significantly
+            deltas['compliance_score'] = +15
+            deltas['engagement_score'] = +10
             last_checkin = timestamp
         elif event_type == 'subscription_cancelled':
-            deltas['revenue_health'] = -50
-            deltas['engagement_score'] = -20
+            overrides['revenue_health'] = 0
+            deltas['engagement_score'] = -30
 
-        # Perform database mutation
-        await self._mutate_state(entity_id, deltas, last_checkin, last_payment)
+        await self._mutate_state(entity_id, deltas, overrides, last_checkin, last_payment)
 
-    async def _mutate_state(self, entity_id: str, deltas: Dict[str, int], last_checkin: str | None, last_payment: str | None):
+    async def _mutate_state(self, entity_id: str, deltas: Dict[str, int], overrides: Dict[str, int], last_checkin: str | None, last_payment: str | None):
         db = self._get_db()
         try:
             # 1. Fetch current state or insert defaults
@@ -64,7 +66,6 @@ class EntityStateEngine:
             )
             
             if not state_res.data:
-                # Insert initial state
                 current_state = {
                     "entity_id": entity_id,
                     "entity_type": "client",
@@ -81,8 +82,14 @@ class EntityStateEngine:
             else:
                 current_state = state_res.data[0]
                 
-                # Apply deltas and bound values to [0, 100]
+                # Apply overrides first
+                for key, val in overrides.items():
+                    current_state[key] = val
+
+                # Apply deltas and bound to [0, 100]
                 for key, delta in deltas.items():
+                    if key in overrides:
+                        continue # Skip delta application if we overrode the value
                     val = current_state.get(key, 100) + delta
                     current_state[key] = max(0, min(100, val))
                 
@@ -100,7 +107,7 @@ class EntityStateEngine:
                     .execute()
                 )
 
-            # 2. Persist to entity_snapshots for audit/temporal tracking
+            # 2. Persist to entity_snapshots for trend metrics
             snapshot = {
                 "entity_id": entity_id,
                 "date": datetime.utcnow().date().isoformat(),
@@ -111,7 +118,6 @@ class EntityStateEngine:
                     "churn_probability": current_state["churn_probability"]
                 }
             }
-            # Upsert snapshot for today
             await asyncio.to_thread(
                 lambda: db.table("entity_snapshots").upsert(snapshot).execute()
             )

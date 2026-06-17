@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict, Any
 from app.services.supabase_client import supabase_service
+from datetime import datetime, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,10 +23,14 @@ class DecisionEngine:
         try:
             # 1. Fetch active signals
             sig_res = await asyncio.to_thread(
-                lambda: db.table("signals").select("*").eq("entity_id", entity_id).execute()
+                lambda: db.table("signals")
+                .select("*")
+                .eq("entity_id", entity_id)
+                .eq("status", "active")
+                .execute()
             )
             
-            # 2. Fetch latest predictions
+            # 2. Fetch latest prediction
             pred_res = await asyncio.to_thread(
                 lambda: db.table("predictions")
                 .select("*")
@@ -38,7 +43,6 @@ class DecisionEngine:
             signals = sig_res.data or []
             prediction = pred_res.data[0] if pred_res.data else {}
 
-            # Business Rules to generate Actions
             for sig in signals:
                 sig_type = sig.get("signal_type")
                 
@@ -59,7 +63,6 @@ class DecisionEngine:
                         reason={"signal": "transformation_stall", "evidence": sig.get("evidence")}
                     )
 
-            # High churn probability rules
             prob = prediction.get("prediction_value", {}).get("probability", 0.0)
             if prob > 0.80:
                 await self._recommend_action(
@@ -76,13 +79,15 @@ class DecisionEngine:
     async def _recommend_action(self, entity_id: str, coach_id: str, priority: int, action_type: str, reason: Dict[str, Any]):
         db = self._get_db()
         try:
-            # Check if action has already been suggested to avoid duplicate recommendations
+            # Deduplication boundary check: Prevent spamming recommendations if suggested in the last 24h
+            time_boundary = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+            
             existing = await asyncio.to_thread(
                 lambda: db.table("actions")
                 .select("id")
                 .eq("entity_id", entity_id)
                 .eq("action_type", action_type)
-                .eq("status", "suggested")
+                .gt("created_at", time_boundary)
                 .execute()
             )
             
@@ -97,7 +102,7 @@ class DecisionEngine:
                         "status": "suggested"
                     }).execute()
                 )
-                logger.info(f"Recommended action logged: {action_type} for entity {entity_id}")
+                logger.info(f"Recommended action logged: {action_type} for entity {entity_id} under Coach {coach_id}")
         except Exception as e:
             logger.error(f"Failed to record action recommendation: {e}")
 

@@ -17,58 +17,114 @@ class BriefingEngine:
             self.db = supabase_service.get_client()
         return self.db
 
-    async def generate_daily_briefing(self, coach_id: str) -> str:
+    async def generate_daily_briefing(self, coach_id: str) -> Dict[str, Any]:
         """
-        Gathers raw metrics, active signals, and proposed actions,
+        Gathers raw metrics, active signals, predictions, and proposed actions,
         and uses Gemini 1.5/2.5 Flash to synthesize a narrative daily briefing.
+        Returns a rich structured JSON payload containing both the narrative and action items.
         """
         db = self._get_db()
         try:
-            # 1. Fetch active signals for the coach's clients
-            # (In production, join tables, here we query the coach_id column on signals)
+            # 1. Fetch active signals
             sig_res = await asyncio.to_thread(
-                lambda: db.table("signals").select("*").eq("coach_id", coach_id).execute()
+                lambda: db.table("signals")
+                .select("*")
+                .eq("coach_id", coach_id)
+                .eq("status", "active")
+                .execute()
             )
+            signals = sig_res.data or []
             
             # 2. Fetch pending actions
             act_res = await asyncio.to_thread(
-                lambda: db.table("actions").select("*").eq("coach_id", coach_id).eq("status", "suggested").execute()
+                lambda: db.table("actions")
+                .select("*")
+                .eq("coach_id", coach_id)
+                .eq("status", "suggested")
+                .execute()
             )
-
-            signals = sig_res.data or []
             actions = act_res.data or []
 
-            # 3. Compile context for LLM
-            context = {
-                "signals": [
-                    {"type": s["signal_type"], "severity": s["severity"], "confidence": s["confidence"]}
-                    for s in signals
-                ],
-                "recommended_actions": [
-                    {"action": a["action_type"], "priority": a["priority"], "reason": a["reason"]}
-                    for a in actions
-                ]
-            }
-
-            if not signals and not actions:
-                return "All clear! There are no urgent alerts, stalled transformations, or revenue risks today."
-
-            # 4. Invoke LLM (Gemini) via LiteLLM
-            if not settings.GEMINI_API_KEY:
-                logger.warning("No GEMINI_API_KEY set. Returning structured JSON string as placeholder.")
-                return f"Offline Mode Briefing: Detected {len(signals)} signals and {len(actions)} recommended actions."
-
-            system_prompt = (
-                "You are an expert AI Chief of Staff for fitness coaches. "
-                "Synthesize the provided structured signals and recommended actions into a concise, professional, "
-                "and highly actionable morning briefing. Highlight urgent items (revenue at risk, client churn risks, transformation stalls) "
-                "clearly. Keep it motivating and brief."
-            )
+            # 3. Fetch auxiliary entities (persons, features, states) to build rich context
+            entity_ids = list(set([s["entity_id"] for s in signals] + [a["entity_id"] for a in actions]))
             
-            user_prompt = f"Here is the daily data: {json.dumps(context)}"
+            persons_map = {}
+            states_map = {}
+            features_map = {}
+            
+            if entity_ids:
+                # Fetch Person names
+                p_res = await asyncio.to_thread(
+                    lambda: db.table("persons").select("id, name, email").in_("id", entity_ids).execute()
+                )
+                persons_map = {row["id"]: row for row in (p_res.data or [])}
 
-            response = await asyncio.to_thread(
-                lambda: litellm.completion(
+                # Fetch Entity States
+                s_res = await asyncio.to_thread(
+                    lambda: db.table("entity_state").select("*").in_("entity_id", entity_ids).execute()
+                )
+                states_map = {row["entity_id"]: row for row in (s_res.data or [])}
+
+                # Fetch Feature Store
+                f_res = await asyncio.to_thread(
+                    lambda: db.table("feature_store").select("*").in_("entity_id", entity_ids).execute()
+                )
+                features_map = {row["entity_id"]: row for row in (f_res.data or [])}
+
+            # 4. Compile rich context list for LLM prompt
+            rich_signals = []
+            revenue_at_risk = 0.0
+            urgent_alerts = []
+
+            for sig in signals:
+                eid = sig["entity_id"]
+                p_name = persons_map.get(eid, {}).get("name", "Unknown Client")
+                p_email = persons_map.get(eid, {}).get("email", "")
+                state = states_map.get(eid, {})
+                features = features_map.get(eid, {})
+                
+                # Check for failed payment amounts in raw/canonical payloads
+                evidence = sig.get("evidence") or {}
+                amount_failed = evidence.get("amount", 0.0)
+                if sig["signal_type"] == "engagement_collapse":
+                    revenue_at_risk += amount_failed
+
+                rich_sig = {
+                    "client_name": p_name,
+                    "client_email": p_email,
+                    "signal_type": sig["signal_type"],
+                    "severity": sig["severity"],
+                    "confidence": sig["confidence"],
+                    "compliance_score": state.get("compliance_score", 100),
+                    "engagement_score": state.get("engagement_score", 100),
+                    "days_since_checkin": features.get("days_since_checkin", 0),
+                    "payment_retry_count": features.get("payment_retry_count", 0),
+                }
+                rich_signals.append(rich_sig)
+                
+                urgent_alerts.append({
+                    "client_name": p_name,
+                    "signal_type": sig["signal_type"],
+                    "severity": sig["severity"],
+                    "action_suggested": next((a["action_type"] for a in actions if a["entity_id"] == eid), "Monitor client closely")
+                })
+
+            # Build narrative using async LiteLLM calls
+            narrative = "All metrics are stable. No active alerts or interventions required today."
+            
+            if rich_signals or actions:
+                system_prompt = (
+                    "You are an expert AI Chief of Staff for elite fitness coaches. "
+                    "Analyze the provided structured client metrics, active alerts, and recommended actions. "
+                    "Synthesize them into a highly professional, narrative daily morning briefing. "
+                    "Refer to clients by their actual names. Highlight immediate priorities (revenue at risk, client compliance drops, transformation stalls) "
+                    "clearly and explain WHY they require attention based on their data. Keep the tone sharp, motivating, and actionable."
+                )
+                
+                user_prompt = f"Coach Business Daily Context:\n{json.dumps({'signals': rich_signals, 'suggested_actions': actions})}"
+                
+                # Native async LLM call
+                response = await litellm.acompletion(
                     model="gemini/gemini-1.5-flash",
                     api_key=settings.GEMINI_API_KEY,
                     messages=[
@@ -76,12 +132,24 @@ class BriefingEngine:
                         {"role": "user", "content": user_prompt}
                     ]
                 )
-            )
-            
-            return response.choices[0].message.content
+                narrative = response.choices[0].message.content
+
+            return {
+                "briefing": narrative,
+                "urgent_alerts": urgent_alerts,
+                "revenue_at_risk": revenue_at_risk,
+                "active_signals_count": len(signals),
+                "pending_actions_count": len(actions)
+            }
 
         except Exception as e:
-            logger.error(f"Failed to generate briefing: {e}")
-            return "Failed to synthesize morning briefing due to an engine error."
+            logger.error(f"Failed to generate structured briefing: {e}")
+            return {
+                "briefing": "Failed to synthesize morning briefing due to an internal server error.",
+                "urgent_alerts": [],
+                "revenue_at_risk": 0.0,
+                "active_signals_count": 0,
+                "pending_actions_count": 0
+            }
 
 briefing_engine = BriefingEngine()

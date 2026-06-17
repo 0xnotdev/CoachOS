@@ -24,6 +24,7 @@ CREATE TABLE canonical_events (
     event_domain VARCHAR(50) NOT NULL,
     event_type VARCHAR(100) NOT NULL, -- payment_failed, workout_missed, message_received
     timestamp TIMESTAMPTZ NOT NULL,
+    structured_payload JSONB,         -- Normalized context: {amount, currency, reason, etc.}
     raw_event_id UUID REFERENCES raw_events(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -35,7 +36,7 @@ CREATE INDEX idx_canonical_events_entity ON canonical_events(entity_type, entity
 CREATE TABLE persons (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255),
-    email VARCHAR(255),
+    email VARCHAR(255) UNIQUE,        -- Database-level uniqueness prevents identity race conditions
     phone VARCHAR(50),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -92,6 +93,7 @@ CREATE TABLE entity_snapshots (
     state JSONB NOT NULL, -- Snapshot of engagement, compliance, weight, etc.
     UNIQUE(entity_id, date)
 );
+CREATE INDEX idx_entity_snapshots_entity_date ON entity_snapshots(entity_id, date DESC);
 
 -- ==========================================
 -- LAYER 6: FEATURE STORE
@@ -120,8 +122,10 @@ CREATE TABLE signals (
     severity VARCHAR(20) NOT NULL,     -- low, medium, high, critical
     confidence FLOAT NOT NULL,
     evidence JSONB,                    -- Array of canonical_event IDs or feature values
+    status VARCHAR(50) DEFAULT 'active', -- active, resolved, dismissed
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX idx_signals_entity_type ON signals(entity_id, signal_type);
 
 -- ==========================================
 -- LAYER 7 & 9: PREDICTIONS & DECISIONS
@@ -131,8 +135,10 @@ CREATE TABLE predictions (
     entity_id UUID NOT NULL,
     model_name VARCHAR(100) NOT NULL,  -- churn_model, expansion_model
     prediction_value JSONB NOT NULL,   -- e.g., {"probability": 0.84}
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(entity_id, model_name)
 );
+CREATE INDEX idx_predictions_entity_created ON predictions(entity_id, created_at DESC);
 
 -- ==========================================
 -- LAYER 10: ACTION GRAPH
