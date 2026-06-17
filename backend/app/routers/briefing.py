@@ -1,70 +1,12 @@
-from fastapi import APIRouter, HTTPException, Header, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from app.services.briefing_engine import briefing_engine
 from app.services.supabase_client import supabase_service
-from app.config import settings
-from uuid import UUID
-import jwt
+from app.dependencies.auth import get_current_coach_id
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-async def get_current_coach_id(
-    authorization: str = Header(None, description="Bearer Supabase Auth Token")
-) -> str:
-    """
-    Decodes and validates the Supabase JWT.
-    Enforces strict token validation and resolves to coaches.auth_user_id.
-    """
-    if not authorization:
-        logger.warning("Unauthenticated request blocked. Missing Authorization header.")
-        raise HTTPException(status_code=401, detail="Authentication credentials required. Please provide a Bearer JWT.")
-
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid token format. Must start with 'Bearer '")
-
-    token = authorization.split(" ")[1]
-    
-    jwt_secret = settings.SUPABASE_JWT_SECRET
-    if not jwt_secret:
-        logger.critical("SUPABASE_JWT_SECRET is not configured in settings. Auth verification blocked.")
-        raise HTTPException(status_code=500, detail="Authentication service configuration error.")
-
-    try:
-        decoded_payload = jwt.decode(
-            token, 
-            jwt_secret, 
-            algorithms=["HS256"], 
-            options={"verify_aud": False, "verify_signature": True}
-        )
-        user_id = decoded_payload.get("sub")
-        
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Subject claim missing from token claims")
-            
-        db = supabase_service.get_client()
-        coach_res = await asyncio.to_thread(
-            lambda: db.table("coaches")
-            .select("id")
-            .eq("auth_user_id", user_id)
-            .execute()
-        )
-        
-        if not coach_res.data:
-            logger.error(f"No Coach entity links to authenticated user ID {user_id}")
-            raise HTTPException(status_code=403, detail="Authenticated user is not registered as a coach")
-            
-        return coach_res.data[0]["id"]
-
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Authentication token has expired")
-    except jwt.InvalidTokenError as e:
-        logger.error(f"JWT Decode error: {e}")
-        raise HTTPException(status_code=401, detail="Invalid auth token signature")
-    except Exception as e:
-        logger.error(f"Authentication processing error: {e}")
-        raise HTTPException(status_code=500, detail="Authentication server error")
 
 @router.get("/today")
 async def get_today_briefing(current_coach_id: str = Depends(get_current_coach_id)):

@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Header, Body
+from fastapi import APIRouter, HTTPException, Depends, Body
 from app.services.supabase_client import supabase_service
+from app.dependencies.auth import get_current_user_id, get_current_coach_id
 from app.config import settings
-from pydantic import BaseModel, EmailStr
+from app.utils.security import security_helper
+from pydantic import BaseModel, EmailStr, Field
 from uuid import UUID, uuid4
-import jwt
 import asyncio
 import logging
 
@@ -15,43 +16,28 @@ class CoachRegisterRequest(BaseModel):
     email: EmailStr
     business_tier: str = "free"
     stripe_connected_account_id: str | None = None
-    stripe_webhook_secret: str | None = None
+
+class StripeIntegrationUpdateRequest(BaseModel):
+    stripe_webhook_secret: str = Field(
+        ..., 
+        description="Write-only Stripe webhook signature secret to decrypt events securely"
+    )
 
 @router.post("/register")
 async def register_new_coach(
     payload: CoachRegisterRequest,
-    authorization: str = Header(None, description="Bearer Supabase Auth Token")
+    user_id: str = Depends(get_current_user_id)
 ):
     """
     Onboards a brand new coach using their Supabase JWT.
     Corrects identity collisions by decoupling auth_user_id from persons.id.
     Includes full recovery path to re-provision missing webhook endpoints on retry.
+    Credentials (webhook secrets) are excluded from registration payloads for logging security.
     """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authentication credentials required. Please provide a Bearer JWT.")
-
-    token = authorization.split(" ")[1]
-    jwt_secret = settings.SUPABASE_JWT_SECRET
-    
-    if not jwt_secret:
-        logger.critical("SUPABASE_JWT_SECRET is not configured.")
-        raise HTTPException(status_code=500, detail="Authentication configuration missing on server.")
-
     # Trim and lowercase email to enforce consistent identity keys
     normalized_email = payload.email.strip().lower()
 
     try:
-        decoded_payload = jwt.decode(
-            token, 
-            jwt_secret, 
-            algorithms=["HS256"], 
-            options={"verify_aud": False, "verify_signature": True}
-        )
-        user_id = decoded_payload.get("sub")
-        
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Subject claim missing from token claims")
-
         db = supabase_service.get_client()
 
         # 1. Check if coach already registered under this auth_user_id
@@ -74,13 +60,13 @@ async def register_new_coach(
             )
             
             if not endpoint_res.data:
-                # Provision missing webhook endpoint on retry
+                # Provision missing webhook endpoint on retry (webhook secret is set separately via PATCH)
                 webhook_token = str(uuid4())
                 await asyncio.to_thread(
                     lambda: db.table("webhook_endpoints").insert({
                         "webhook_token": webhook_token,
                         "coach_id": coach_id,
-                        "stripe_webhook_secret": payload.stripe_webhook_secret
+                        "stripe_webhook_secret": None
                     }).execute()
                 )
                 logger.info(f"Recovered and provisioned missing webhook endpoint for coach {coach_id}")
@@ -133,7 +119,7 @@ async def register_new_coach(
             lambda: db.table("webhook_endpoints").insert({
                 "webhook_token": webhook_token,
                 "coach_id": coach_id,
-                "stripe_webhook_secret": payload.stripe_webhook_secret
+                "stripe_webhook_secret": None
             }).execute()
         )
 
@@ -145,11 +131,42 @@ async def register_new_coach(
             "webhook_url": webhook_url
         }
 
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Authentication token has expired")
-    except jwt.InvalidTokenError as e:
-        logger.error(f"JWT Decode error: {e}")
-        raise HTTPException(status_code=401, detail="Invalid token signature")
     except Exception as e:
         logger.error(f"Failed to provision coach: {e}")
         raise HTTPException(status_code=500, detail="Provisioning process failed")
+
+@router.patch("/integrations/stripe")
+async def update_stripe_credentials(
+    payload: StripeIntegrationUpdateRequest,
+    current_coach_id: str = Depends(get_current_coach_id)
+):
+    """
+    Securely uploads and encrypts integration credentials (stripe_webhook_secret) at rest.
+    """
+    db = supabase_service.get_client()
+    try:
+        # Encrypt Stripe webhook signature secret before database insertion
+        encrypted_secret = security_helper.encrypt(payload.stripe_webhook_secret)
+
+        update_res = await asyncio.to_thread(
+            lambda: db.table("webhook_endpoints")
+            .update({"stripe_webhook_secret": encrypted_secret})
+            .eq("coach_id", current_coach_id)
+            .execute()
+        )
+        
+        if not update_res.data:
+            raise HTTPException(
+                status_code=404, 
+                detail="Webhook endpoint configuration mapping not found for coach integration"
+            )
+            
+        return {
+            "status": "success",
+            "message": "Stripe webhook signature credentials encrypted and updated successfully."
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"Failed to secure Stripe credentials: {e}")
+        raise HTTPException(status_code=500, detail="Credential encryption update failed")

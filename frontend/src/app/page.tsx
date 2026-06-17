@@ -171,8 +171,7 @@ export default function Home() {
         body: JSON.stringify({
           name: regName,
           email: regEmail,
-          stripe_connected_account_id: stripeAcct || null,
-          stripe_webhook_secret: webhookSecret || null
+          stripe_connected_account_id: stripeAcct || null
         })
       });
 
@@ -182,6 +181,22 @@ export default function Home() {
       }
 
       const res = await response.json();
+      
+      // If a webhook secret is specified, securely patch it using the separate integration endpoint
+      if (webhookSecret) {
+        const secretResponse = await fetch(`${API_URL}/api/v1/coaches/integrations/stripe`, {
+          method: "PATCH",
+          headers: getHeaders(),
+          body: JSON.stringify({
+            stripe_webhook_secret: webhookSecret
+          })
+        });
+        if (!secretResponse.ok) {
+          const secretErr = await secretResponse.json();
+          throw new Error(secretErr.detail || "Failed to secure webhook signature credentials.");
+        }
+      }
+
       setOnboardResult(res);
       alert("Registration completed successfully!");
       setActiveTab("briefing");

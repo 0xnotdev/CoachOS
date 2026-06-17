@@ -10,9 +10,17 @@ from typing import Optional, Dict, Any
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
-stripe.api_key = settings.STRIPE_API_KEY
 
 class StripeAdapter:
+    def __init__(self):
+        # Prevent open/uninitialized API keys. Require value on server boot.
+        if not settings.STRIPE_API_KEY:
+            raise ValueError(
+                "STRIPE_API_KEY is not configured in settings. "
+                "The server requires a valid Stripe key to initialize payment adapters."
+            )
+        stripe.api_key = settings.STRIPE_API_KEY
+
     async def handle_webhook(self, payload: bytes, sig_header: str, coach_id: str, webhook_secret: str) -> Optional[Dict[str, Any]]:
         """
         Parses webhook with the coach-specific signature secret and triggers pipeline logic.
@@ -120,8 +128,6 @@ class StripeAdapter:
             canonical_type = "subscription_cancelled"
 
         # 5. Enforce Canonical Schema Contract validation in Python.
-        # Allow validation_event.event_id to generate its own unique UUID (to enable 1-to-many fanout).
-        # Store raw_event_id as original_event_id in metadata tracking.
         validation_event = CanonicalEvent(
             coach_id=UUID(coach_id),
             entity_type=EntityType.CLIENT,
@@ -143,10 +149,11 @@ class StripeAdapter:
                 "event_type": validation_event.event_type,
                 "timestamp": validation_event.occurred_at.isoformat(),
                 "structured_payload": validation_event.payload,
-                "raw_event_id": str(raw_event_id) # Correctly links raw_event_id to the source record
+                "raw_event_id": str(raw_event_id)
             }).execute()
         )
         
         return canonical_insert.data[0]
 
+# Global singleton instantiated on module load (raises if config is missing)
 stripe_adapter = StripeAdapter()

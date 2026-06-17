@@ -5,6 +5,7 @@ from app.services.supabase_client import supabase_service
 from app.services.feature_store import feature_store_service
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -31,10 +32,18 @@ async def lifespan(app: FastAPI):
         days=1,
         id="cron_recalculate_time_deltas"
     )
-    scheduler.start()
-    logger.info("APScheduler initialized: Registered daily feature store recalculation job.")
     
-    await feature_store_service.cron_recalculate_time_deltas()
+    # Schedule cron to run asynchronously 30 seconds after server startup,
+    # preventing server block and health check drop failures under load.
+    scheduler.add_job(
+        feature_store_service.cron_recalculate_time_deltas,
+        "date",
+        run_date=datetime.now() + timedelta(seconds=30),
+        id="initial_recalculate_time_deltas"
+    )
+    
+    scheduler.start()
+    logger.info("APScheduler initialized: Daily cron scheduled (with 30s deferred initial run).")
     
     yield
     
@@ -48,10 +57,16 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Enforce secure CORS policy configuration in production
+origins = settings.ALLOWED_ORIGINS_LIST
+allow_creds = True
+if "*" in origins:
+    allow_creds = False # Browser spec blocks credential transfer on wildcard origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
+    allow_origins=origins, 
+    allow_credentials=allow_creds,
     allow_methods=["*"],
     allow_headers=["*"],
 )

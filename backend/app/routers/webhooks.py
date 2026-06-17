@@ -7,6 +7,7 @@ from app.services.prediction_engine import prediction_engine
 from app.services.decision_engine import decision_engine
 from app.services.supabase_client import supabase_service
 from app.config import settings
+from app.utils.security import security_helper
 from uuid import UUID
 import asyncio
 import logging
@@ -65,7 +66,13 @@ async def stripe_webhook(
         
     record = endpoint_res.data[0]
     coach_id = record["coach_id"]
-    webhook_secret = record.get("stripe_webhook_secret") or settings.STRIPE_WEBHOOK_SECRET
+    
+    # Securely decrypt the webhook secret before constructing the verification event
+    encrypted_secret = record.get("stripe_webhook_secret")
+    if encrypted_secret:
+        webhook_secret = security_helper.decrypt(encrypted_secret)
+    else:
+        webhook_secret = settings.STRIPE_WEBHOOK_SECRET
     
     if not webhook_secret:
         logger.error("No Stripe webhook secret configured on webhook endpoint or environment variables.")
@@ -78,7 +85,6 @@ async def stripe_webhook(
         raise HTTPException(status_code=400, detail="Missing signature header")
 
     try:
-        # Pass the coach-specific webhook_secret to support true multi-tenant accounts
         canonical_event = await stripe_adapter.handle_webhook(payload, sig_header, str(coach_id), webhook_secret)
         
         if canonical_event:

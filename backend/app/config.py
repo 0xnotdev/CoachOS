@@ -17,6 +17,15 @@ class Settings(BaseSettings):
     # LLM (Using LiteLLM to route to free-tier models like Gemini 1.5 Flash)
     GEMINI_API_KEY: str = ""
 
+    # Security Origins & Encryption
+    ALLOWED_ORIGINS: str = "*"
+
+    @property
+    def ALLOWED_ORIGINS_LIST(self) -> list[str]:
+        if not self.ALLOWED_ORIGINS or self.ALLOWED_ORIGINS == "*":
+            return ["*"]
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
+
     class Config:
         case_sensitive = True
         env_file = ".env"

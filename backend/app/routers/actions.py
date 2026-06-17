@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Body
-from app.routers.briefing import get_current_coach_id
+from app.dependencies.auth import get_current_coach_id
 from app.services.supabase_client import supabase_service
 from pydantic import BaseModel, Field
 from datetime import datetime
