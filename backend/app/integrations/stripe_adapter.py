@@ -119,9 +119,10 @@ class StripeAdapter:
         elif event_type == "customer.subscription.deleted":
             canonical_type = "subscription_cancelled"
 
-        # 5. Enforce Canonical Schema Contract validation in Python
+        # 5. Enforce Canonical Schema Contract validation in Python.
+        # Allow validation_event.event_id to generate its own unique UUID (to enable 1-to-many fanout).
+        # Store raw_event_id as original_event_id in metadata tracking.
         validation_event = CanonicalEvent(
-            event_id=UUID(raw_event_id),
             coach_id=UUID(coach_id),
             entity_type=EntityType.CLIENT,
             entity_id=UUID(str(person_id)),
@@ -142,7 +143,7 @@ class StripeAdapter:
                 "event_type": validation_event.event_type,
                 "timestamp": validation_event.occurred_at.isoformat(),
                 "structured_payload": validation_event.payload,
-                "raw_event_id": str(validation_event.event_id)
+                "raw_event_id": str(raw_event_id) # Correctly links raw_event_id to the source record
             }).execute()
         )
         
