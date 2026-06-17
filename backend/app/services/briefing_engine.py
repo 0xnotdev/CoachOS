@@ -21,7 +21,6 @@ class BriefingEngine:
         """
         Gathers raw metrics, active signals, predictions, and proposed actions,
         and uses Gemini 1.5/2.5 Flash to synthesize a narrative daily briefing.
-        Returns a rich structured JSON payload containing both the narrative and action items.
         """
         db = self._get_db()
         try:
@@ -75,14 +74,15 @@ class BriefingEngine:
 
             for sig in signals:
                 eid = sig["entity_id"]
+                sig_id = sig["id"]
                 p_name = persons_map.get(eid, {}).get("name", "Unknown Client")
                 p_email = persons_map.get(eid, {}).get("email", "")
                 state = states_map.get(eid, {})
                 features = features_map.get(eid, {})
                 
-                # Check for failed payment amounts in raw/canonical payloads
+                # Retrieve the failed payment amount to compute accurate revenue at risk
                 evidence = sig.get("evidence") or {}
-                amount_failed = evidence.get("amount", 0.0)
+                amount_failed = float(evidence.get("amount", 0.0))
                 if sig["signal_type"] == "engagement_collapse":
                     revenue_at_risk += amount_failed
 
@@ -99,8 +99,8 @@ class BriefingEngine:
                 }
                 rich_signals.append(rich_sig)
                 
-                # Map matching action suggested for UI execution triggers
-                matching_action = next((a for a in actions if a["entity_id"] == eid), None)
+                # Pair accurately using signal_id link instead of generic positional entity matches
+                matching_action = next((a for a in actions if a.get("signal_id") == sig_id), None)
                 urgent_alerts.append({
                     "action_id": matching_action["id"] if matching_action else None,
                     "client_name": p_name,

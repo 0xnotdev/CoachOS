@@ -31,7 +31,7 @@ class SignalEngine:
 
             features = feat_res.data[0]
             
-            # Rule 1: Engagement Collapse
+            # Rule 1: Engagement Collapse (injects failed payment amount to estimate revenue at risk)
             if features.get("payment_retry_count", 0) > 1 and features.get("days_since_checkin", 0) > 7:
                 await self._trigger_signal(
                     coach_id=coach_id,
@@ -39,7 +39,11 @@ class SignalEngine:
                     signal_type="engagement_collapse",
                     severity="high",
                     confidence=0.85,
-                    evidence={"payment_retry_count": features["payment_retry_count"], "days_since_checkin": features["days_since_checkin"]}
+                    evidence={
+                        "payment_retry_count": features["payment_retry_count"], 
+                        "days_since_checkin": features["days_since_checkin"],
+                        "amount": features.get("last_failed_payment_amount", 0.0)
+                    }
                 )
 
             # Rule 2: Transformation Stall

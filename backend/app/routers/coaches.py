@@ -37,6 +37,9 @@ async def register_new_coach(
         logger.critical("SUPABASE_JWT_SECRET is not configured.")
         raise HTTPException(status_code=500, detail="Authentication configuration missing on server.")
 
+    # Trim and lowercase email to enforce consistent identity keys
+    normalized_email = payload.email.strip().lower()
+
     try:
         decoded_payload = jwt.decode(
             token, 
@@ -96,12 +99,11 @@ async def register_new_coach(
         person_res = await asyncio.to_thread(
             lambda: db.table("persons")
             .select("id")
-            .eq("email", payload.email)
+            .eq("email", normalized_email)
             .execute()
         )
         
         if person_res.data:
-            # Reuses existing cross-system identity record, preventing email collision errors
             person_id = person_res.data[0]["id"]
         else:
             # Create a new person record with a unique uuid
@@ -109,7 +111,7 @@ async def register_new_coach(
                 lambda: db.table("persons").insert({
                     "id": str(uuid4()),
                     "name": payload.name,
-                    "email": payload.email
+                    "email": normalized_email
                 }).execute()
             )
             person_id = new_person.data[0]["id"]

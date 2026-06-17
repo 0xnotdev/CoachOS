@@ -39,17 +39,18 @@ class IdentityResolutionService:
     async def get_or_create_person(self, email: str, name: str) -> UUID:
         """
         Retrieves a Person UUID by email. If not found, attempts to insert a new Person.
-        Guarded against race conditions via exception catching and fallback query.
+        Normalizes email strings by trimming whitespace and lowercasing to prevent case-sensitive duplication.
         """
+        normalized_email = email.strip().lower()
         try:
-            return await asyncio.to_thread(self._get_or_create_person_sync, email, name)
+            return await asyncio.to_thread(self._get_or_create_person_sync, normalized_email, name)
         except Exception as e:
-            logger.error(f"Error getting/creating person for email {email}: {e}")
+            logger.error(f"Error getting/creating person for email {normalized_email}: {e}")
             # Fallback query in case of race condition
             try:
-                return await asyncio.to_thread(self._find_person_by_email_sync, email)
+                return await asyncio.to_thread(self._find_person_by_email_sync, normalized_email)
             except Exception as fe:
-                logger.critical(f"Critical identity resolution failure for {email}: {fe}")
+                logger.critical(f"Critical identity resolution failure for {normalized_email}: {fe}")
                 raise fe
 
     def _find_person_by_email_sync(self, email: str) -> UUID:
@@ -98,4 +99,5 @@ class IdentityResolutionService:
         }, on_conflict="source,external_id").execute()
         logger.info(f"Linked {source}:{external_id} to person {person_id}")
 
+# Global singleton
 identity_service = IdentityResolutionService()

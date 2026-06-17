@@ -126,17 +126,17 @@ export default function Home() {
     }
   };
 
-  const handleExecuteAction = async (actionId: string, clientName: string) => {
+  const handleUpdateAction = async (actionId: string, clientName: string, status: "completed" | "rejected") => {
     setActioningId(actionId);
     try {
       const response = await fetch(`${API_URL}/api/v1/actions/${actionId}`, {
         method: "PATCH",
         headers: getHeaders(),
-        body: JSON.stringify({ status: "completed" })
+        body: JSON.stringify({ status })
       });
 
       if (!response.ok) {
-        throw new Error("Failed to execute action.");
+        throw new Error(`Failed to update action to ${status}.`);
       }
 
       if (data) {
@@ -148,9 +148,9 @@ export default function Home() {
           pending_actions_count: Math.max(0, data.pending_actions_count - 1)
         });
       }
-      alert(`Action successfully executed for ${clientName}`);
+      alert(`Action successfully ${status === 'completed' ? 'executed' : 'dismissed'} for ${clientName}`);
     } catch (err: any) {
-      alert(`Error executing action: ${err.message}`);
+      alert(`Error updating action: ${err.message}`);
     } finally {
       setActioningId(null);
     }
@@ -344,19 +344,29 @@ export default function Home() {
                         </p>
                       </div>
                       
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                        <span style={{ color: 'var(--text-secondary)', fontSize: '0.95rem' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                        <span style={{ color: 'var(--text-secondary)', fontSize: '0.95rem', marginRight: '0.75rem' }}>
                           Target: <strong style={{ color: 'var(--text-primary)' }}>{alert.action_suggested.replace(/_/g, ' ')}</strong>
                         </span>
                         {alert.action_id && (
-                          <button 
-                            className="btn btn-primary" 
-                            style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }} 
-                            disabled={actioningId === alert.action_id}
-                            onClick={() => handleExecuteAction(alert.action_id!, alert.client_name)}
-                          >
-                            {actioningId === alert.action_id ? "Executing..." : "Execute Action"}
-                          </button>
+                          <>
+                            <button 
+                              className="btn btn-primary" 
+                              style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }} 
+                              disabled={actioningId === alert.action_id}
+                              onClick={() => handleUpdateAction(alert.action_id!, alert.client_name, "completed")}
+                            >
+                              {actioningId === alert.action_id ? "Executing..." : "Execute"}
+                            </button>
+                            <button 
+                              className="btn btn-secondary" 
+                              style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }} 
+                              disabled={actioningId === alert.action_id}
+                              onClick={() => handleUpdateAction(alert.action_id!, alert.client_name, "rejected")}
+                            >
+                              Dismiss
+                            </button>
+                          </>
                         )}
                       </div>
                     </div>

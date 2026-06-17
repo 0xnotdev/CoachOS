@@ -79,20 +79,38 @@ async def get_today_briefing(current_coach_id: str = Depends(get_current_coach_i
 async def get_coach_clients(current_coach_id: str = Depends(get_current_coach_id)):
     """
     Returns all clients under the authenticated coach joined with state and feature metrics.
+    Correctly paginates queries via .range() limit boundaries to scale past database defaults.
     """
     db = supabase_service.get_client()
     try:
-        clients_res = await asyncio.to_thread(
-            lambda: db.table("clients")
-            .select("id, person_id, status")
-            .eq("coach_id", current_coach_id)
-            .execute()
-        )
+        client_records = []
+        page_size = 100
+        start = 0
+        has_more = True
         
-        if not clients_res.data:
+        while has_more:
+            end = start + page_size - 1
+            clients_res = await asyncio.to_thread(
+                lambda: db.table("clients")
+                .select("id, person_id, status")
+                .eq("coach_id", current_coach_id)
+                .range(start, end)
+                .execute()
+            )
+            
+            if not clients_res.data:
+                break
+                
+            client_records.extend(clients_res.data)
+            
+            if len(clients_res.data) < page_size:
+                has_more = False
+            else:
+                start += page_size
+
+        if not client_records:
             return []
 
-        client_records = clients_res.data
         person_ids = [c["person_id"] for c in client_records]
 
         persons_task = asyncio.to_thread(

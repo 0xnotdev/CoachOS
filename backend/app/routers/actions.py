@@ -4,6 +4,7 @@ from app.services.supabase_client import supabase_service
 from pydantic import BaseModel, Field
 from datetime import datetime
 from uuid import UUID
+from typing import Literal
 import asyncio
 import logging
 
@@ -11,7 +12,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 class ActionUpdateSchema(BaseModel):
-    status: str = Field(..., description="Target status: accepted, rejected, completed")
+    status: Literal["suggested", "accepted", "rejected", "completed"] = Field(
+        ..., 
+        description="Target status: suggested, accepted, rejected, completed"
+    )
 
 @router.patch("/{action_id}")
 async def update_action_status(

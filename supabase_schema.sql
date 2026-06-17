@@ -25,7 +25,7 @@ CREATE INDEX idx_identities_person ON identities(person_id);
 CREATE TABLE coaches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     person_id UUID NOT NULL REFERENCES persons(id),
-    auth_user_id UUID UNIQUE,         -- Separates Supabase auth account from cross-system person entities
+    auth_user_id UUID UNIQUE,
     business_tier VARCHAR(50),
     stripe_connected_account_id VARCHAR(255)
 );
@@ -112,6 +112,7 @@ CREATE TABLE feature_store (
     workout_completion_rate FLOAT,
     weekly_weight_change FLOAT,
     last_known_weight FLOAT,
+    last_failed_payment_amount FLOAT DEFAULT 0.0, -- Stores failed payment value to evaluate revenue at risk
     coach_response_time_avg FLOAT,
     payment_retry_count INTEGER,
     program_adherence_rate FLOAT,
@@ -155,6 +156,7 @@ CREATE TABLE actions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     entity_id UUID NOT NULL,
     coach_id UUID REFERENCES coaches(id),
+    signal_id UUID REFERENCES signals(id), -- Direct link back to the triggering signal
     priority INTEGER NOT NULL,
     action_type VARCHAR(100) NOT NULL,
     reason JSONB NOT NULL,
@@ -169,19 +171,52 @@ CREATE TABLE actions (
 -- ROW-LEVEL SECURITY (RLS) POLICIES
 -- ==========================================
 ALTER TABLE persons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE coaches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
+ALTER TABLE programs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE webhook_endpoints ENABLE ROW LEVEL SECURITY;
-ALTER TABLE signals ENABLE ROW LEVEL SECURITY;
-ALTER TABLE actions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE raw_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE canonical_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entity_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_snapshots ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feature_store ENABLE ROW LEVEL SECURITY;
+ALTER TABLE signals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE predictions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE actions ENABLE ROW LEVEL SECURITY;
 
--- Decoupled RLS verification: Scopes to auth_user_id instead of person_id
+-- Decoupled RLS Policies
+CREATE POLICY persons_coach_policy ON persons
+    FOR ALL USING (
+        id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE auth_user_id = auth.uid()
+            )
+        ) OR id IN (
+            SELECT person_id FROM coaches WHERE auth_user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY identities_coach_policy ON identities
+    FOR ALL USING (
+        person_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE auth_user_id = auth.uid()
+            )
+        ) OR person_id IN (
+            SELECT person_id FROM coaches WHERE auth_user_id = auth.uid()
+        )
+    );
+
 CREATE POLICY coach_self_policy ON coaches 
     FOR ALL USING (auth_user_id = auth.uid());
 
 CREATE POLICY client_scope_policy ON clients
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
+    );
+
+CREATE POLICY programs_coach_policy ON programs
     FOR ALL USING (
         coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
     );
@@ -191,17 +226,25 @@ CREATE POLICY webhook_endpoints_policy ON webhook_endpoints
         coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
     );
 
-CREATE POLICY signals_coach_policy ON signals
-    FOR ALL USING (
-        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
-    );
-
-CREATE POLICY actions_coach_policy ON actions
-    FOR ALL USING (
-        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
+CREATE POLICY canonical_events_coach_policy ON canonical_events
+    FOR SELECT USING (
+        entity_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE auth_user_id = auth.uid()
+            )
+        )
     );
 
 CREATE POLICY entity_state_scope_policy ON entity_state
+    FOR SELECT USING (
+        entity_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE auth_user_id = auth.uid()
+            )
+        )
+    );
+
+CREATE POLICY entity_snapshots_coach_policy ON entity_snapshots
     FOR SELECT USING (
         entity_id IN (
             SELECT person_id FROM clients WHERE coach_id IN (
@@ -217,6 +260,25 @@ CREATE POLICY feature_store_scope_policy ON feature_store
                 SELECT id FROM coaches WHERE auth_user_id = auth.uid()
             )
         )
+    );
+
+CREATE POLICY signals_coach_policy ON signals
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
+    );
+
+CREATE POLICY predictions_coach_policy ON predictions
+    FOR SELECT USING (
+        entity_id IN (
+            SELECT person_id FROM clients WHERE coach_id IN (
+                SELECT id FROM coaches WHERE auth_user_id = auth.uid()
+            )
+        )
+    );
+
+CREATE POLICY actions_coach_policy ON actions
+    FOR ALL USING (
+        coach_id IN (SELECT id FROM coaches WHERE auth_user_id = auth.uid())
     );
 
 -- ==========================================

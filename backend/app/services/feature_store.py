@@ -36,6 +36,7 @@ class FeatureStoreService:
                 "workout_completion_rate": 1.0,
                 "weekly_weight_change": 0.0,
                 "last_known_weight": None,
+                "last_failed_payment_amount": 0.0,
                 "coach_response_time_avg": 0.0,
                 "payment_retry_count": 0,
                 "program_adherence_rate": 1.0
@@ -47,9 +48,11 @@ class FeatureStoreService:
             if event_type == "payment_failed":
                 features["payment_retry_count"] = features.get("payment_retry_count", 0) + 1
                 features["days_since_payment"] = 0
+                features["last_failed_payment_amount"] = float(payload.get("amount", 0.0))
             elif event_type == "payment_succeeded":
                 features["payment_retry_count"] = 0
                 features["days_since_payment"] = 0
+                features["last_failed_payment_amount"] = 0.0
             elif event_type == "checkin_completed":
                 features["days_since_checkin"] = 0
                 features["program_adherence_rate"] = min(1.0, features.get("program_adherence_rate", 1.0) * 0.9 + 0.1)
