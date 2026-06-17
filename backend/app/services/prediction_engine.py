@@ -18,19 +18,26 @@ class PredictionEngine:
 
     async def compute_predictions(self, entity_id: str):
         """
-        Calculates churn probabilities using a smooth, continuous sigmoid formula.
+        Calculates churn probabilities using a smooth, continuous multi-variable sigmoid formula.
+        Features utilized:
+          - program_adherence_rate (Deficit increases risk)
+          - payment_retry_count (Fatigue / retry count increases risk)
+          - days_since_checkin (Silent days neglect penalty)
         """
         db = self._get_db()
         try:
-            # 1. Fetch features and client profile (for coach_id lookup) in parallel
+            # 1. Fetch features, client profile, and state in parallel
             feat_task = asyncio.to_thread(
                 lambda: db.table("feature_store").select("*").eq("entity_id", entity_id).execute()
             )
             client_task = asyncio.to_thread(
                 lambda: db.table("clients").select("coach_id").eq("person_id", entity_id).execute()
             )
+            state_task = asyncio.to_thread(
+                lambda: db.table("entity_state").select("last_checkin").eq("entity_id", entity_id).execute()
+            )
             
-            feat_res, client_res = await asyncio.gather(feat_task, client_task)
+            feat_res, client_res, state_res = await asyncio.gather(feat_task, client_task, state_task)
             
             if not feat_res.data:
                 return
@@ -41,19 +48,30 @@ class PredictionEngine:
             if client_res.data:
                 coach_id = client_res.data[0]["coach_id"]
 
-            # 2. Continuous Sigmoid Churn Scoring (no cliff effects)
+            # 2. Extract feature variables
             adherence = features.get("program_adherence_rate", 1.0)
             retries = features.get("payment_retry_count", 0)
             
+            # Compute days_since_checkin dynamically
+            days_since_checkin = 0
+            if state_res.data and state_res.data[0].get("last_checkin"):
+                last_checkin_str = state_res.data[0]["last_checkin"]
+                last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                days_since_checkin = max(0, (now - last_checkin).days)
+
+            # 3. Continuous Multi-Variable Sigmoid Churn Scoring (no cliff effects)
             adherence_deficit = 1.0 - adherence
             payment_fatigue = 1.0 - (1.0 / (1.0 + retries))
+            neglect_factor = 1.0 - (1.0 / (1.0 + (days_since_checkin / 7.0)))
             
-            z = (adherence_deficit * 3.5) + (payment_fatigue * 4.0) - 2.5
+            # Weighted logit (z) combination
+            z = (adherence_deficit * 3.0) + (payment_fatigue * 4.0) + (neglect_factor * 2.5) - 2.5
             churn_prob = 1.0 / (1.0 + math.exp(-z))
             
             churn_prob = max(0.01, min(0.99, churn_prob))
 
-            # 3. Upsert prediction with updated_at refresh
+            # 4. Upsert prediction with updated_at refresh
             now = datetime.now(timezone.utc).isoformat()
             await asyncio.to_thread(
                 lambda: db.table("predictions").upsert({
