@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict, Any, List
 from app.services.supabase_client import supabase_service
+from app.services.notification_service import notification_service
 from datetime import datetime, timezone
 import logging
 
@@ -128,6 +129,14 @@ class SignalEngine:
                     }).execute()
                 )
                 logger.info(f"Signal triggered: {signal_type} for entity {entity_id}")
+                
+                # Async dispatch notification to coach
+                await notification_service.enqueue_notification(
+                    coach_id=coach_id,
+                    title=f"New Signal: {signal_type.replace('_', ' ').title()}",
+                    body=f"Client {entity_id} triggered alert: {signal_type.replace('_', ' ')} ({severity})",
+                    channel="email"
+                )
         except Exception as e:
             logger.error(f"Failed to record signal: {e}")
 

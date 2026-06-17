@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict, Any, Optional
 from app.services.supabase_client import supabase_service
+from app.services.notification_service import notification_service
 import logging
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,14 @@ class DecisionEngine:
                     }).execute()
                 )
                 logger.info(f"Recommended action logged: {action_type} for entity {entity_id} under Coach {coach_id}")
+
+                # Enqueue push notification about new action recommendation
+                await notification_service.enqueue_notification(
+                    coach_id=coach_id,
+                    title="New Action Recommended",
+                    body=f"Recommended action '{action_type.replace('_', ' ').title()}' for client {entity_id} (Priority: {priority})",
+                    channel="push"
+                )
         except Exception as e:
             logger.error(f"Failed to record action recommendation: {e}")
 

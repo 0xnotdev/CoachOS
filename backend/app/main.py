@@ -4,6 +4,7 @@ from app.config import settings
 from app.services.supabase_client import supabase_service
 from app.services.feature_store import feature_store_service
 from app.services.task_queue import task_queue
+from app.services.notification_service import notification_service
 from app.utils.logging import setup_logging, request_id_ctx
 from app.utils.rate_limiter import limiter
 from slowapi import _rate_limit_exceeded_handler
