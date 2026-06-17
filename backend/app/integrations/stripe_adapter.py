@@ -17,7 +17,6 @@ class StripeAdapter:
         Parses webhook with the coach-specific signature secret and triggers pipeline logic.
         """
         try:
-            # Enforces verification using the specific secret onboarding of that coach
             event = stripe.Webhook.construct_event(
                 payload, sig_header, webhook_secret
             )
@@ -67,13 +66,30 @@ class StripeAdapter:
         person_id = await identity_service.resolve_identity("stripe", customer_id)
         
         if not person_id:
+            # Query Stripe Connect account ID from coaches record to isolate customer fetch context
+            coach_res = await asyncio.to_thread(
+                lambda: db.table("coaches")
+                .select("stripe_connected_account_id")
+                .eq("id", coach_id)
+                .execute()
+            )
+            connected_account_id = None
+            if coach_res.data:
+                connected_account_id = coach_res.data[0].get("stripe_connected_account_id")
+
             email = data_object.get("customer_email") or data_object.get("email")
             if not email and settings.STRIPE_API_KEY:
                 try:
-                    customer = await asyncio.to_thread(stripe.Customer.retrieve, customer_id)
+                    # Enforce Stripe Connect platform delegation headers to retrieve resource
+                    customer = await asyncio.to_thread(
+                        lambda: stripe.Customer.retrieve(
+                            customer_id, 
+                            stripe_account=connected_account_id
+                        ) if connected_account_id else stripe.Customer.retrieve(customer_id)
+                    )
                     email = customer.get("email")
                 except Exception as e:
-                    logger.error(f"Failed to retrieve customer {customer_id}: {e}")
+                    logger.error(f"Failed to retrieve customer {customer_id} for Connect Account {connected_account_id}: {e}")
 
             if not email:
                 email = f"unresolved_{customer_id}@coachos.internal"

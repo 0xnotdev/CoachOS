@@ -25,7 +25,8 @@ CREATE INDEX idx_identities_person ON identities(person_id);
 CREATE TABLE coaches (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     person_id UUID NOT NULL REFERENCES persons(id),
-    business_tier VARCHAR(50)
+    business_tier VARCHAR(50),
+    stripe_connected_account_id VARCHAR(255) -- Support multi-tenant Stripe Connect integrations
 );
 
 CREATE TABLE clients (

@@ -24,7 +24,6 @@ class FeatureStoreService:
             event_type = new_event.get("event_type")
             payload = new_event.get("structured_payload") or {}
             
-            # Fetch current features
             feat_res = await asyncio.to_thread(
                 lambda: db.table("feature_store").select("*").eq("entity_id", entity_id).execute()
             )
@@ -45,7 +44,6 @@ class FeatureStoreService:
             if feat_res.data:
                 features = feat_res.data[0]
 
-            # Update features based on event type
             if event_type == "payment_failed":
                 features["payment_retry_count"] = features.get("payment_retry_count", 0) + 1
                 features["days_since_payment"] = 0
@@ -58,7 +56,6 @@ class FeatureStoreService:
             elif event_type == "workout_missed":
                 features["program_adherence_rate"] = max(0.0, features.get("program_adherence_rate", 1.0) * 0.9)
             
-            # Mathematical correction for weekly_weight_change
             if "weight" in payload:
                 new_weight = float(payload["weight"])
                 last_weight = features.get("last_known_weight")
@@ -90,44 +87,60 @@ class FeatureStoreService:
 
     async def cron_recalculate_time_deltas(self):
         """
-        Scheduled daily batch job that increments 'days_since_checkin' and 'days_since_payment'
-        based on the last event timestamps stored in entity_state.
+        Scheduled daily batch job that increments 'days_since_checkin' and 'days_since_payment'.
+        Correctly paginates queries via .range() limit boundaries to scale past database defaults.
         """
         db = self._get_db()
         try:
             logger.info("Running daily feature store time-delta recalculation cron...")
             
-            states = await asyncio.to_thread(
-                lambda: db.table("entity_state").select("entity_id, last_checkin, last_payment").execute()
-            )
-            
-            if not states.data:
-                return
-
+            page_size = 100
+            start = 0
+            has_more = True
             now = datetime.utcnow()
-            for row in states.data:
-                entity_id = row["entity_id"]
-                last_checkin_str = row.get("last_checkin")
-                last_payment_str = row.get("last_payment")
+            
+            while has_more:
+                end = start + page_size - 1
+                logger.info(f"Fetching entity states in range {start} to {end}")
                 
-                days_since_checkin = 999
-                days_since_payment = 999
-                
-                if last_checkin_str:
-                    last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
-                    days_since_checkin = (now.date() - last_checkin.date()).days
-                    
-                if last_payment_str:
-                    last_payment = datetime.fromisoformat(last_payment_str.replace("Z", "+00:00"))
-                    days_since_payment = (now.date() - last_payment.date()).days
-
-                await asyncio.to_thread(
-                    self._upsert_features_batch,
-                    entity_id,
-                    max(0, days_since_checkin),
-                    max(0, days_since_payment),
-                    now.isoformat()
+                states = await asyncio.to_thread(
+                    lambda: db.table("entity_state")
+                    .select("entity_id, last_checkin, last_payment")
+                    .range(start, end)
+                    .execute()
                 )
+                
+                if not states.data:
+                    break
+
+                for row in states.data:
+                    entity_id = row["entity_id"]
+                    last_checkin_str = row.get("last_checkin")
+                    last_payment_str = row.get("last_payment")
+                    
+                    days_since_checkin = 999
+                    days_since_payment = 999
+                    
+                    if last_checkin_str:
+                        last_checkin = datetime.fromisoformat(last_checkin_str.replace("Z", "+00:00"))
+                        days_since_checkin = (now.date() - last_checkin.date()).days
+                        
+                    if last_payment_str:
+                        last_payment = datetime.fromisoformat(last_payment_str.replace("Z", "+00:00"))
+                        days_since_payment = (now.date() - last_payment.date()).days
+
+                    await asyncio.to_thread(
+                        self._upsert_features_batch,
+                        entity_id,
+                        max(0, days_since_checkin),
+                        max(0, days_since_payment),
+                        now.isoformat()
+                    )
+                
+                if len(states.data) < page_size:
+                    has_more = False
+                else:
+                    start += page_size
             
             logger.info("Daily feature store time-delta recalculation completed.")
             
