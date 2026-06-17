@@ -1,5 +1,8 @@
 from fastapi import APIRouter, Request, HTTPException, Path
 from app.integrations.stripe_adapter import stripe_adapter
+from app.integrations.calendly_adapter import calendly_adapter
+from app.integrations.typeform_adapter import typeform_adapter
+from app.integrations.trainerize_adapter import trainerize_adapter
 from app.services.state_engine import state_engine
 from app.services.feature_store import feature_store_service
 from app.services.signal_engine import signal_engine
@@ -52,29 +55,39 @@ async def execute_event_pipeline_task(payload: dict, coach_id: str):
     """
     await execute_event_pipeline(payload, coach_id)
 
+async def validate_webhook_token(webhook_token: UUID) -> str:
+    """
+    Standardized helper to validate multi-tenant webhook tokens and resolve coach_id.
+    """
+    db = supabase_service.get_client()
+    endpoint_res = await asyncio.to_thread(
+        lambda: db.table("webhook_endpoints")
+        .select("coach_id")
+        .eq("webhook_token", str(webhook_token))
+        .execute()
+    )
+    if not endpoint_res.data:
+        logger.warning(f"Unauthorized webhook token: {webhook_token}")
+        raise HTTPException(status_code=401, detail="Invalid webhook endpoint token")
+    return endpoint_res.data[0]["coach_id"]
+
 @router.post("/stripe/{webhook_token}")
 async def stripe_webhook(
     request: Request, 
     webhook_token: UUID = Path(..., description="The unique, unguessable webhook endpoint token registered for a coach")
 ):
     db = supabase_service.get_client()
+    coach_id = await validate_webhook_token(webhook_token)
     
-    # Resolve coach_id and the custom webhook secret for this coach integration endpoint
+    # Retrieve webhook secret for the webhook endpoint signature checks
     endpoint_res = await asyncio.to_thread(
         lambda: db.table("webhook_endpoints")
-        .select("coach_id, stripe_webhook_secret")
+        .select("stripe_webhook_secret")
         .eq("webhook_token", str(webhook_token))
         .execute()
     )
-    
-    if not endpoint_res.data:
-        logger.warning(f"Unauthorized webhook token: {webhook_token}")
-        raise HTTPException(status_code=401, detail="Invalid webhook endpoint token")
-        
     record = endpoint_res.data[0]
-    coach_id = record["coach_id"]
     
-    # Securely decrypt the webhook secret before constructing the verification event
     encrypted_secret = record.get("stripe_webhook_secret")
     if encrypted_secret:
         webhook_secret = security_helper.decrypt(encrypted_secret)
@@ -95,7 +108,6 @@ async def stripe_webhook(
         canonical_event = await stripe_adapter.handle_webhook(payload, sig_header, str(coach_id), webhook_secret)
         
         if canonical_event:
-            # Enqueue task in SQLite queue using canonical event UUID as task_id (guarantees idempotency)
             task_id = canonical_event.get("id")
             await task_queue.enqueue(
                 task_id=task_id,
@@ -109,4 +121,70 @@ async def stripe_webhook(
         logger.error(f"Stripe webhook processing failed for Coach {coach_id}: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
         
+    return {"status": "success"}
+
+@router.post("/calendly/{webhook_token}")
+async def calendly_webhook(
+    payload: dict,
+    webhook_token: UUID = Path(..., description="The unique, unguessable webhook endpoint token registered for a coach")
+):
+    coach_id = await validate_webhook_token(webhook_token)
+    try:
+        canonical_event = await calendly_adapter.process_calendly_event(payload, coach_id)
+        if canonical_event:
+            task_id = canonical_event.get("id")
+            await task_queue.enqueue(
+                task_id=task_id,
+                task_name="execute_event_pipeline",
+                payload=canonical_event,
+                coach_id=str(coach_id)
+            )
+            logger.info(f"Calendly event queued in durable task queue for Coach {coach_id}: {canonical_event.get('event_type')}")
+    except Exception as e:
+        logger.error(f"Calendly webhook processing failed for Coach {coach_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success"}
+
+@router.post("/typeform/{webhook_token}")
+async def typeform_webhook(
+    payload: dict,
+    webhook_token: UUID = Path(..., description="The unique, unguessable webhook endpoint token registered for a coach")
+):
+    coach_id = await validate_webhook_token(webhook_token)
+    try:
+        canonical_event = await typeform_adapter.process_typeform_event(payload, coach_id)
+        if canonical_event:
+            task_id = canonical_event.get("id")
+            await task_queue.enqueue(
+                task_id=task_id,
+                task_name="execute_event_pipeline",
+                payload=canonical_event,
+                coach_id=str(coach_id)
+            )
+            logger.info(f"Typeform event queued in durable task queue for Coach {coach_id}: {canonical_event.get('event_type')}")
+    except Exception as e:
+        logger.error(f"Typeform webhook processing failed for Coach {coach_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success"}
+
+@router.post("/trainerize/{webhook_token}")
+async def trainerize_webhook(
+    payload: dict,
+    webhook_token: UUID = Path(..., description="The unique, unguessable webhook endpoint token registered for a coach")
+):
+    coach_id = await validate_webhook_token(webhook_token)
+    try:
+        canonical_event = await trainerize_adapter.process_trainerize_event(payload, coach_id)
+        if canonical_event:
+            task_id = canonical_event.get("id")
+            await task_queue.enqueue(
+                task_id=task_id,
+                task_name="execute_event_pipeline",
+                payload=canonical_event,
+                coach_id=str(coach_id)
+            )
+            logger.info(f"Trainerize event queued in durable task queue for Coach {coach_id}: {canonical_event.get('event_type')}")
+    except Exception as e:
+        logger.error(f"Trainerize webhook processing failed for Coach {coach_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
     return {"status": "success"}
